@@ -1066,7 +1066,7 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
             mm_features: List of multimodal feature specifications
 
         Yields:
-            Tuple of (offset, grid_t, grid_h, grid_w) for each frame/image
+            Tuple of (offset, grid_t, grid_h, grid_w, t_factor) for each frame/image
         """
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 1.0)
