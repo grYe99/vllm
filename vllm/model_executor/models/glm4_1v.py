@@ -617,6 +617,11 @@ class Glm4vVisionTransformer(nn.Module):
     ) -> None:
         super().__init__()
 
+        use_data_parallel = is_vit_use_data_parallel()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+
         patch_size = vision_config.patch_size
         temporal_patch_size = vision_config.temporal_patch_size
         in_channels = vision_config.in_channels
