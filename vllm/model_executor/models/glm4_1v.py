@@ -29,7 +29,7 @@ compatible with HuggingFace weights."""
 
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from functools import partial
+from functools import lru_cache, partial
 from typing import Annotated, Any, Literal, TypeAlias
 
 import numpy as np
@@ -691,42 +691,87 @@ class Glm4vVisionTransformer(nn.Module):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def rot_pos_emb(
-        self, grid_thw: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pos_ids = []
-        for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            hpos_ids = (
-                hpos_ids.reshape(
-                    h // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                    w // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                )
-                .permute(0, 2, 1, 3)
-                .flatten()
-            )
-            wpos_ids = (
-                wpos_ids.reshape(
-                    h // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                    w // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                )
-                .permute(0, 2, 1, 3)
-                .flatten()
-            )
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
+    # def rot_pos_emb(
+    #     self, grid_thw: torch.Tensor
+    # ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    #     pos_ids = []
+    #     for t, h, w in grid_thw:
+    #         hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+    #         wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+    #         hpos_ids = (
+    #             hpos_ids.reshape(
+    #                 h // self.spatial_merge_size,
+    #                 self.spatial_merge_size,
+    #                 w // self.spatial_merge_size,
+    #                 self.spatial_merge_size,
+    #             )
+    #             .permute(0, 2, 1, 3)
+    #             .flatten()
+    #         )
+    #         wpos_ids = (
+    #             wpos_ids.reshape(
+    #                 h // self.spatial_merge_size,
+    #                 self.spatial_merge_size,
+    #                 w // self.spatial_merge_size,
+    #                 self.spatial_merge_size,
+    #             )
+    #             .permute(0, 2, 1, 3)
+    #             .flatten()
+    #         )
+    #         pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+    #     pos_ids = torch.cat(pos_ids, dim=0)
+    #     max_grid_size = grid_thw[:, 1:].max()
+
+    #     # Use pre-computed cos_sin_cache from RotaryEmbedding
+    #     cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+
+    #     cos_combined = cos[pos_ids].flatten(1)
+    #     sin_combined = sin[pos_ids].flatten(1)
+    #     return cos_combined, sin_combined, pos_ids
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+        hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+        h_div = h // spatial_merge_size
+        w_div = w // spatial_merge_size
+        hpos_ids = hpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+        hpos_ids = hpos_ids.flatten()
+
+        wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+        wpos_ids = wpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+        wpos_ids = wpos_ids.flatten()
+
+        return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+    def rot_pos_emb(self, grid_thw: list[list[int]]):
+        max_grid_size = max(max(h, w) for _, h, w in grid_thw)
+        pos_ids = [
+            self.rot_pos_ids(h, w, self.spatial_merge_size)
+            if t == 1
+            else self.rot_pos_ids(h, w, self.spatial_merge_size).repeat(t, 1)
+            for t, h, w in grid_thw
+        ]
+        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
 
         # Use pre-computed cos_sin_cache from RotaryEmbedding
         cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
 
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
+
         return cos_combined, sin_combined, pos_ids
 
     def compute_attn_mask_seqlen(
