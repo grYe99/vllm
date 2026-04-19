@@ -775,7 +775,7 @@ class Glm4vVisionTransformer(nn.Module):
         metadata: dict[str, torch.Tensor | None] = {}
 
         # Positional embeddings
-        metadata["pos_embeds"] = self.fast_pos_embed_interpolate(grid_thw_list)
+        # metadata["pos_embeds"] = self.fast_pos_embed_interpolate(grid_thw_list)
         rotary_cos, rotary_sin, image_type_ids = self.rot_pos_emb(grid_thw_list)
         metadata["rotary_pos_emb_cos"] = rotary_cos
         metadata["rotary_pos_emb_sin"] = rotary_sin
@@ -863,7 +863,7 @@ class Glm4vVisionTransformer(nn.Module):
         # )
         rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
         rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
-        # image_type_ids = encoder_metadata["image_type_ids"]  # 看起来useless
+        image_type_ids = encoder_metadata["image_type_ids"]
 
         # compute cu_seqlens
         # cu_seqlens = torch.repeat_interleave(
@@ -880,6 +880,11 @@ class Glm4vVisionTransformer(nn.Module):
 
         cu_seqlens = encoder_metadata["cu_seqlens"]
         max_seqlen = encoder_metadata["max_seqlen"]
+
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        x = self.embeddings(
+            x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
+        )
 
         # transformers
         x = x.unsqueeze(1)
@@ -1689,7 +1694,8 @@ class Glm4vForConditionalGeneration(
                 "video": "pixel_values_videos",
             },
             buffer_keys=[
-                "pos_embeds",
+                # "pos_embeds",
+                "image_type_ids",
                 "rotary_pos_emb_cos",
                 "rotary_pos_emb_sin",
                 "cu_seqlens",
