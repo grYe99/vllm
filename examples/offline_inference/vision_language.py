@@ -575,7 +575,13 @@ def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
             "fps": 1,
         },
         limit_mm_per_prompt={modality: 1},
-        enforce_eager=True,
+        # enforce_eager=True,
+        compilation_config={
+            "cudagraph_mm_encoder": True,
+            "encoder_cudagraph_token_budgets": [128, 256, 512, 1024, 1536, 2048],
+            "encoder_cudagraph_max_vision_items_per_batch": 4,
+            "encoder_cudagraph_max_frames_per_batch": 32,
+        },
     )
 
     if modality == "image":
