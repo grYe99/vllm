@@ -1582,6 +1582,14 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
             for item in mm_data.pop("videos", []):
                 video_array, metadata = item
 
+                for key in ["total_num_frames", "fps", "duration"]:
+                    if key in metadata:
+                        metadata[key] = int(metadata[key])
+                if "frames_indices" in metadata:
+                    metadata["frames_indices"] = [
+                        int(i) for i in metadata["frames_indices"]
+                    ]
+
                 # don't update mm_kwargs inplace
                 video_mm_kwargs = dict(**mm_kwargs)
                 video_mm_kwargs["do_sample_frames"] = metadata.get(
