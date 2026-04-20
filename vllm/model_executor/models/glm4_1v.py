@@ -139,8 +139,8 @@ if HAS_TRITON:
     def _bilinear_pos_embed_kernel(
         embed_ptr,
         output_ptr,
-        H,
-        W,
+        H: tl.constexpr,
+        W: tl.constexpr,
         h_scale,
         w_scale,
         NUM_GRID: tl.constexpr,
