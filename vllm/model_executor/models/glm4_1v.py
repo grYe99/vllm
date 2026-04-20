@@ -139,8 +139,8 @@ if HAS_TRITON:
     def _bilinear_pos_embed_kernel(
         embed_ptr,
         output_ptr,
-        H: tl.constexpr,
-        W: tl.constexpr,
+        H,
+        W,
         h_scale,
         w_scale,
         NUM_GRID: tl.constexpr,
@@ -962,9 +962,9 @@ class Glm4vVisionTransformer(nn.Module):
             outputs.append(
                 interpolate_fn(
                     self.embeddings.position_embedding.weight,
-                    t,
-                    h,
-                    w,
+                    int(t),
+                    int(h),
+                    int(w),
                     self.num_grid_per_side,
                     self.spatial_merge_size,
                     self.dtype,
