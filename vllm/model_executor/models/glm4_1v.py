@@ -942,7 +942,7 @@ class Glm4vVisionTransformer(nn.Module):
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
 
-        return cos_combined, sin_combined, pos_ids
+        return cos_combined, sin_combined
 
     def compute_attn_mask_seqlen(
         self,
@@ -1010,7 +1010,7 @@ class Glm4vVisionTransformer(nn.Module):
 
         # Positional embeddings
         metadata["pos_embeds"] = self.fast_pos_embed_interpolate(grid_thw_list)
-        rotary_cos, rotary_sin, image_type_ids = self.rot_pos_emb(grid_thw_list)
+        rotary_cos, rotary_sin = self.rot_pos_emb(grid_thw_list)
         metadata["rotary_pos_emb_cos"] = rotary_cos
         metadata["rotary_pos_emb_sin"] = rotary_sin
 
