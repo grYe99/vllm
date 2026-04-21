@@ -1102,7 +1102,7 @@ class Glm4vVisionTransformer(nn.Module):
                 rotary_pos_emb_cos=encoder_metadata["rotary_pos_emb_cos"],
                 rotary_pos_emb_sin=encoder_metadata["rotary_pos_emb_sin"],
                 max_seqlen=encoder_metadata["max_seqlen"],
-                sequence_lengths=encoder_metadata["sequence_lengths"],
+                sequence_lengths=encoder_metadata.get("sequence_lengths"),
             )
 
         # adapter
