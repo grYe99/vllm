@@ -1929,7 +1929,7 @@ class Glm4vForConditionalGeneration(
         # Max: capped by max_num_batched_tokens
         max_budget = min(
             vllm_config.scheduler_config.max_num_batched_tokens,
-            self.model_config.max_model_len,
+            vllm_config.model_config.max_model_len,
         )
         return (min_budget, max_budget)
 
