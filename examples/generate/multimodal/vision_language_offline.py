@@ -576,7 +576,7 @@ def run_glm4v(questions: list[str], modality: str) -> ModelRequestData:
 
 # GLM-4.1V
 def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
-    model_name = "zai-org/GLM-4.1V-9B-Thinking"
+    model_name = "cyankiwi/GLM-4.6V-Flash-AWQ-4bit"
 
     mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
