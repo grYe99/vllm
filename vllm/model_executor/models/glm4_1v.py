@@ -1251,12 +1251,11 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
         image_height: int,
         num_frames: int,
     ) -> int:
-        video_processor = self.get_video_processor()
         _, num_video_tokens = self._get_vision_info(
             image_width=image_width,
             image_height=image_height,
             num_frames=num_frames,
-            max_image_pixels=video_processor.size["longest_edge"],
+            max_image_pixels=self._get_image_max_pixels(),
         )
         return num_video_tokens
 
