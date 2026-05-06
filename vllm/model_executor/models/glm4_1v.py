@@ -1920,14 +1920,6 @@ class Glm4vForConditionalGeneration(
         return "video"
 
     def get_max_frames_per_video(self) -> int:
-        print(
-            "ygr: image Processor Longest Edge: ",
-            self.get_image_processor().size["longest_edge"],
-        )
-        print(
-            "ygr: video Processor Longest Edge: ",
-            self.get_video_processor().size["longest_edge"],
-        )
         return _MAX_FRAMES_PER_VIDEO
 
     def get_encoder_cudagraph_budget_range(
