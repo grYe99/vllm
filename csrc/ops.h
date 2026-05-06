@@ -156,6 +156,11 @@ void silu_and_mul_per_block_quant(torch::Tensor& out,
                                   std::optional<torch::Tensor> scale_ub,
                                   bool is_scale_transposed);
 
+void silu_and_mul_per_token_quant(torch::Tensor& out,
+                                  torch::Tensor const& input,
+                                  torch::Tensor& scales,
+                                  std::optional<torch::Tensor> scale_ub);
+
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       std::optional<torch::Tensor> key, int64_t head_size,
                       torch::Tensor& cos_sin_cache, bool is_neox,

@@ -128,6 +128,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("silu_and_mul_per_block_quant", torch::kCUDA,
            &silu_and_mul_per_block_quant);
 
+  // Fused SiLU+Mul + per-token quantization
+  ops.def(
+      "silu_and_mul_per_token_quant("
+      "Tensor! out, "
+      "Tensor input, "
+      "Tensor! scales, "
+      "Tensor? scale_ub=None) -> () ");
+  ops.impl("silu_and_mul_per_token_quant", torch::kCUDA,
+           &silu_and_mul_per_token_quant);
+
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
   ops.impl("mul_and_silu", torch::kCUDA, &mul_and_silu);
 
