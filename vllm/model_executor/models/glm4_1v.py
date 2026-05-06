@@ -1294,51 +1294,6 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
 
         return max(max_frames_per_video, 1)
 
-    def eval_num_frames_with_most_features(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-    ) -> int:
-        max_images = mm_counts.get("image", 0)
-        max_videos = mm_counts.get("video", 0)
-
-        max_image_size, _ = self._get_vision_info(
-            image_width=9999999, image_height=9999999
-        )
-
-        target_width, target_height = max_image_size
-
-        max_image_tokens = (
-            self.get_num_image_tokens(
-                image_width=target_width,
-                image_height=target_height,
-            )
-            * max_images
-        )
-
-        #
-        num_frames = 0
-        max_tokens = seq_len - max_image_tokens
-        while True:
-            next_num_frames = num_frames + 1
-            next_max_tokens = self.get_num_video_tokens(
-                image_width=target_width,
-                image_height=target_height,
-                num_frames=next_num_frames,
-            )
-            if next_max_tokens > max_tokens or next_max_tokens == 0:
-                break
-
-            num_frames = next_num_frames
-
-        max_total_frames = num_frames
-
-        max_frames_per_video = min(
-            max_total_frames // max(max_videos, 1), _MAX_FRAMES_PER_VIDEO
-        )
-
-        return max(max_frames_per_video, 1)
-
     def _get_video_second_idx_glm4v(
         self, metadata: dict[str, Any], total_frames: int
     ) -> list[int]:
@@ -1967,10 +1922,16 @@ class Glm4vForConditionalGeneration(
     def get_max_frames_per_video(self) -> int:
         mm_registry = MULTIMODAL_REGISTRY
         info = mm_registry.get_processing_info(self.model_config)
-        max_frames_per_video = info.eval_num_frames_with_most_features(
+        max_frames_per_video = info.get_num_frames_with_most_features(
             seq_len=self.model_config.max_model_len,
             mm_counts={"video": self.multimodal_config.get_limit_per_prompt("video")},
         )
+
+        image_longest = info.get_image_processor().size["longest_edge"]
+        video_longest = info.get_video_processor().size["longest_edge"]
+        max_frames_from_info = video_longest // image_longest
+
+        max_frames_per_video = max(max_frames_per_video, max_frames_from_info)
 
         return max_frames_per_video
 
