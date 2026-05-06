@@ -581,13 +581,14 @@ def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
     mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
-        max_model_len=2048,
+        max_model_len=4096,
         max_num_seqs=2,
         mm_processor_kwargs={
             "size": {"shortest_edge": 12544, "longest_edge": 47040000},
             "fps": 1,
         },
         limit_mm_per_prompt=mm_limit,
+        gpu_memory_utilization=0.6,
     )
 
     image_placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
