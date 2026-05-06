@@ -582,6 +582,7 @@ def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
+        max_num_seqs=2,
         limit_mm_per_prompt=mm_limit,
     )
 
