@@ -1931,7 +1931,7 @@ class Glm4vForConditionalGeneration(
         video_longest = info.get_video_processor().size["longest_edge"]
         max_frames_from_info = video_longest // image_longest
 
-        max_frames_per_video = max(max_frames_per_video, max_frames_from_info)
+        max_frames_per_video = max(max_frames_per_video, max_frames_from_info, 16)
         return max_frames_per_video
 
     def get_encoder_cudagraph_budget_range(
