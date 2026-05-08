@@ -12,8 +12,9 @@ from vllm import LLM
 def vllm_visual():
     print("Loading vLLM model ...")
     llm = LLM(
-        model="zai-org/GLM-4.1V-9B-Thinking",
+        model="cyankiwi/GLM-4.6V-Flash-AWQ-4bit",
         enforce_eager=True,
+        gpu_memory_utilization=0.6,
     )
     vllm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     return vllm_model.visual
