@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import pytest
 import torch
 from transformers import Glm4vForConditionalGeneration as HFGlm4v
@@ -10,6 +12,7 @@ from vllm import LLM
 
 @pytest.fixture(scope="module")
 def vllm_visual():
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     print("Loading vLLM model ...")
     llm = LLM(
         model="cyankiwi/GLM-4.6V-Flash-AWQ-4bit",
