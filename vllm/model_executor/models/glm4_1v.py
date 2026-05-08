@@ -93,7 +93,6 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
@@ -132,194 +131,6 @@ _MAX_FRAMES_PER_VIDEO = 600
 # The spatial-merge reorder is baked into the index math so the output
 # is ready to be added to the patch embeddings directly.
 # ---------------------------------------------------------------------------
-
-if HAS_TRITON:
-
-    @triton.jit
-    def _bilinear_pos_embed_kernel(
-        embed_ptr,
-        output_ptr,
-        H,
-        W,
-        h_scale,
-        w_scale,
-        NUM_GRID: tl.constexpr,
-        M_SIZE: tl.constexpr,
-        HIDDEN_DIM: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        """Fused bilinear pos-embed interpolation with spatial-merge reorder."""
-        pid = tl.program_id(0)
-        total_spatial = H * W
-        spatial_idx = pid % total_spatial
-
-        num_blocks_w = W // M_SIZE
-        block_idx = spatial_idx // (M_SIZE * M_SIZE)
-        local_idx = spatial_idx % (M_SIZE * M_SIZE)
-        br = block_idx // num_blocks_w
-        bc = block_idx % num_blocks_w
-        lr = local_idx // M_SIZE
-        lc = local_idx % M_SIZE
-        row = br * M_SIZE + lr
-        col = bc * M_SIZE + lc
-
-        h_frac = row.to(tl.float32) * h_scale
-        w_frac = col.to(tl.float32) * w_scale
-
-        hf = tl.math.floor(h_frac).to(tl.int32)
-        wf = tl.math.floor(w_frac).to(tl.int32)
-        hc = tl.minimum(hf + 1, NUM_GRID - 1)
-        wc = tl.minimum(wf + 1, NUM_GRID - 1)
-
-        dh = h_frac - hf.to(tl.float32)
-        dw = w_frac - wf.to(tl.float32)
-        w11 = dh * dw
-        w10 = dh - w11
-        w01 = dw - w11
-        w00 = 1.0 - dh - w01
-
-        off00 = (hf * NUM_GRID + wf) * HIDDEN_DIM
-        off01 = (hf * NUM_GRID + wc) * HIDDEN_DIM
-        off10 = (hc * NUM_GRID + wf) * HIDDEN_DIM
-        off11 = (hc * NUM_GRID + wc) * HIDDEN_DIM
-        out_off = pid * HIDDEN_DIM
-
-        # Cast weights to output dtype so the multiply-accumulate stays
-        # in the same precision as the native PyTorch implementation.
-        out_dtype = output_ptr.dtype.element_ty
-        w00_c = w00.to(out_dtype)
-        w01_c = w01.to(out_dtype)
-        w10_c = w10.to(out_dtype)
-        w11_c = w11.to(out_dtype)
-
-        for d in tl.range(0, HIDDEN_DIM, BLOCK_D):
-            cols = d + tl.arange(0, BLOCK_D)
-            mask = cols < HIDDEN_DIM
-
-            e00 = tl.load(embed_ptr + off00 + cols, mask=mask)
-            e01 = tl.load(embed_ptr + off01 + cols, mask=mask)
-            e10 = tl.load(embed_ptr + off10 + cols, mask=mask)
-            e11 = tl.load(embed_ptr + off11 + cols, mask=mask)
-
-            val = w00_c * e00 + w01_c * e01 + w10_c * e10 + w11_c * e11
-
-            tl.store(output_ptr + out_off + cols, val, mask=mask)
-
-    def triton_pos_embed_interpolate(
-        embed_weight: torch.Tensor,
-        t: int,
-        h: int,
-        w: int,
-        num_grid_per_side: int,
-        m_size: int,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Launch the fused Triton kernel for one (t,h,w) grid.
-
-        Returns a tensor of shape ``(t * h * w, hidden_dim)`` with the
-        bilinearly-interpolated position embeddings in spatial-merge order.
-        """
-        assert h % m_size == 0 and w % m_size == 0, (
-            f"h={h} and w={w} must be divisible by m_size={m_size}"
-        )
-        hidden_dim = embed_weight.shape[1]
-        total_out = t * h * w
-        output = torch.empty(
-            total_out,
-            hidden_dim,
-            device=embed_weight.device,
-            dtype=dtype,
-        )
-
-        h_scale = float(num_grid_per_side - 1) / float(h - 1) if h > 1 else 0.0
-        w_scale = float(num_grid_per_side - 1) / float(w - 1) if w > 1 else 0.0
-
-        BLOCK_D = triton.next_power_of_2(hidden_dim)
-
-        _bilinear_pos_embed_kernel[(total_out,)](
-            embed_weight,
-            output,
-            h,
-            w,
-            h_scale,
-            w_scale,
-            num_grid_per_side,
-            m_size,
-            hidden_dim,
-            BLOCK_D,
-        )
-        return output
-
-
-def pos_embed_interpolate_native(
-    embed_weight: torch.Tensor,
-    t: int,
-    h: int,
-    w: int,
-    num_grid_per_side: int,
-    m_size: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Eager PyTorch bilinear position-embedding interpolation.
-
-    Returns a tensor of shape ``(t * h * w, hidden_dim)`` with the
-    bilinearly-interpolated position embeddings in spatial-merge order.
-    """
-    assert h % m_size == 0 and w % m_size == 0, (
-        f"h={h} and w={w} must be divisible by m_size={m_size}"
-    )
-    hidden_dim = embed_weight.shape[1]
-    device = embed_weight.device
-
-    h_idxs = torch.linspace(
-        0,
-        num_grid_per_side - 1,
-        h,
-        dtype=torch.float32,
-        device=device,
-    )
-    w_idxs = torch.linspace(
-        0,
-        num_grid_per_side - 1,
-        w,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    h_floor = h_idxs.to(torch.long)
-    w_floor = w_idxs.to(torch.long)
-    h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-    w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
-
-    dh = h_idxs - h_floor
-    dw = w_idxs - w_floor
-
-    dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-    h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-    h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
-
-    w11 = dh_grid * dw_grid
-    w10 = dh_grid - w11
-    w01 = dw_grid - w11
-    w00 = 1 - dh_grid - w01
-
-    h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
-    w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
-    h_grid_idx = h_grid * num_grid_per_side
-
-    indices = (h_grid_idx + w_grid).reshape(4, -1)
-    weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-    weights = weights.to(dtype=dtype)
-
-    embeds = embed_weight[indices]
-    embeds *= weights
-    combined = embeds.sum(dim=0)
-
-    combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
-    combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
-    repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
-    return repeated.to(dtype=dtype)
-
 
 # === Vision Inputs === #
 
@@ -954,23 +765,33 @@ class Glm4vVisionTransformer(nn.Module):
         return max_seqlen
 
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
-        interpolate_fn = (
-            triton_pos_embed_interpolate if HAS_TRITON else pos_embed_interpolate_native
-        )
-        outputs = []
+        device = self.embeddings.position_embedding.weight.device
+        dtype = self.dtype
+        all_embeds = []
+
         for t, h, w in grid_thw:
-            outputs.append(
-                interpolate_fn(
-                    self.embeddings.position_embedding.weight,
-                    int(t),
-                    int(h),
-                    int(w),
-                    self.num_grid_per_side,
-                    self.spatial_merge_size,
-                    self.dtype,
-                )
+            h_coords = (
+                torch.arange(h, device=device).unsqueeze(1).expand(h, w).reshape(-1)
             )
-        return torch.cat(outputs, dim=0)
+            w_coords = (
+                torch.arange(w, device=device).unsqueeze(0).expand(h, w).reshape(-1)
+            )
+
+            lengths = [h * w]
+            image_shapes = torch.tensor([[t, h, w]], device=device)
+
+            embeds = self.embeddings(
+                embeddings=torch.empty(
+                    1, 0, self.hidden_size, device=device, dtype=dtype
+                ),
+                lengths=lengths,
+                image_shapes=image_shapes,
+                h_coords=h_coords,
+                w_coords=w_coords,
+            )
+            all_embeds.append(embeds)
+
+        return torch.cat(all_embeds, dim=0).to(dtype)
 
     def prepare_encoder_metadata(
         self,
