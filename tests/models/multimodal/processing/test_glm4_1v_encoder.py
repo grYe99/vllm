@@ -17,7 +17,11 @@ def vllm_visual():
         gpu_memory_utilization=0.6,
         max_model_len=4096,
     )
-    vllm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    engine_core = llm.llm_engine.engine_core.engine_core
+    model_runner = engine_core.model_executor.driver_worker.worker.model_runner
+    vllm_model = model_runner.model
+    # vllm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+
     return vllm_model.visual
 
 
