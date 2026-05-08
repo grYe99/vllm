@@ -15,6 +15,7 @@ def vllm_visual():
         model="cyankiwi/GLM-4.6V-Flash-AWQ-4bit",
         enforce_eager=True,
         gpu_memory_utilization=0.6,
+        max_model_len=4096,
     )
     vllm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     return vllm_model.visual
