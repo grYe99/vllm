@@ -764,7 +764,7 @@ class Glm4vVisionTransformer(nn.Module):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
 
-    def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
+    def pos_embeds_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
         device = self.embeddings.position_embedding.weight.device
         dtype = self.dtype
         all_embeds = []
@@ -789,6 +789,7 @@ class Glm4vVisionTransformer(nn.Module):
                 h_coords=h_coords,
                 w_coords=w_coords,
             )
+            embeds = embeds.repeat(t, 1)
             all_embeds.append(embeds)
 
         return torch.cat(all_embeds, dim=0).to(dtype)
@@ -826,7 +827,7 @@ class Glm4vVisionTransformer(nn.Module):
         metadata: dict[str, torch.Tensor | None] = {}
 
         # Positional embeddings
-        metadata["pos_embeds"] = self.fast_pos_embed_interpolate(grid_thw_list)
+        metadata["pos_embeds"] = self.pos_embeds_interpolate(grid_thw_list)
         rotary_cos, rotary_sin = self.rot_pos_emb(grid_thw_list)
         metadata["rotary_pos_emb_cos"] = rotary_cos
         metadata["rotary_pos_emb_sin"] = rotary_sin
