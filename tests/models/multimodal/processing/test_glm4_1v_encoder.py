@@ -24,7 +24,7 @@ def vllm_visual():
 def hf_visual():
     print("Loading HF model ...")
     hf_model = HFGlm4v.from_pretrained(
-        "zai-org/GLM-4.1V-9B-Thinking",
+        "cyankiwi/GLM-4.6V-Flash-AWQ-4bit",
         torch_dtype=torch.bfloat16,
         device_map="cuda",
     ).eval()
