@@ -781,8 +781,8 @@ class Glm4vVisionTransformer(nn.Module):
             image_shapes = torch.tensor([[t, h, w]], device=device)
 
             embeds = self.embeddings(
-                embeddings=torch.empty(
-                    1, 0, self.hidden_size, device=device, dtype=dtype
+                embeddings=torch.zeros(
+                    h * w, self.hidden_size, device=device, dtype=dtype
                 ),
                 lengths=lengths,
                 image_shapes=image_shapes,
