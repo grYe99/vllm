@@ -1725,7 +1725,25 @@ class Glm4vForConditionalGeneration(
         return "video"
 
     def get_max_frames_per_video(self) -> int:
-        return 0
+        mm_registry = MULTIMODAL_REGISTRY
+        info = mm_registry.get_processing_info(self.model_config)
+        max_frames_per_video = info.get_num_frames_with_most_features(
+            seq_len=self.model_config.max_model_len,
+            mm_counts={"video": self.multimodal_config.get_limit_per_prompt("video")},
+        )
+
+        image_longest = info.get_image_processor().size["longest_edge"]
+        video_longest = info.get_video_processor().size["longest_edge"]
+        max_frames_from_info = video_longest // image_longest
+
+        logger.error(
+            "=====ygr, max_frames_per_video: %s, max_frames_from_info: %s",
+            max_frames_per_video,
+            max_frames_from_info,
+        )
+
+        max_frames_per_video = max(max_frames_per_video, max_frames_from_info, 16)
+        return max_frames_per_video
 
     def get_encoder_cudagraph_budget_range(
         self,
