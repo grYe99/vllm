@@ -303,6 +303,13 @@ class EncoderCudaGraphManager:
             else:
                 n = src.shape[0]
                 buf.zero_()
+                logger.error(
+                    "====ygr: key=%s, buf.shape=%s, src.shape=%s, n=%d",
+                    key,
+                    buf.shape,
+                    src.shape,
+                    n,
+                )
                 buf[:n].copy_(src)
 
         graph_meta.graph.replay()

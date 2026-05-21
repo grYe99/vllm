@@ -828,9 +828,10 @@ class Glm4vVisionTransformer(nn.Module):
         # For videos each item contributes T frames = T attention sequences,
         # so the total can exceed max_batch_size. max_frames_per_batch
         # overrides the pad target when set.
-        pad_to = (
-            max_frames_per_batch if max_frames_per_batch is not None else max_batch_size
-        )
+        if max_frames_per_batch is not None and max_frames_per_batch > 0:
+            pad_to = max_frames_per_batch
+        else:
+            pad_to = max_batch_size
         if pad_to is not None:
             num_seqs = len(cu_seqlens) - 1
             if num_seqs < pad_to:
@@ -1866,6 +1867,15 @@ class Glm4vForConditionalGeneration(
                 [1, spatial_merge_size, per_mm_item_output * spatial_merge_size]
                 for _ in range(max_batch_size)
             ]
+        logger.error(
+            "====ygr: capture: frames_per_item=%d, "
+            "max_frames_per_batch=%d, max_batch_size=%d, "
+            "grid_config=%s",
+            frames_per_item,
+            max_frames_per_batch,
+            max_batch_size,
+            grid_config,
+        )
 
         # Create dummy pixel_values
         patch_embed = self.visual.patch_embed
@@ -1913,6 +1923,12 @@ class Glm4vForConditionalGeneration(
     ):
         modality = self.get_input_modality(mm_kwargs)
         grid_thw_list = self._get_grid_thw_by_modality(mm_kwargs)
+        logger.error(
+            "====ygr: replay: modality=%s, max_frames_per_batch=%d, grid_thw_list=%s",
+            modality,
+            max_frames_per_batch,
+            grid_thw_list,
+        )
 
         if modality == "image":
             buffers = self.visual.prepare_encoder_metadata(
