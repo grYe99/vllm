@@ -697,7 +697,7 @@ class Glm4vVisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(
-        self, grid_thw: torch.Tensor
+        self, grid_thw: list[list[int]]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pos_ids = []
         for t, h, w in grid_thw:
@@ -725,7 +725,7 @@ class Glm4vVisionTransformer(nn.Module):
             )
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
+        max_grid_size = max(max(h, w) for _, h, w in grid_thw)
 
         # Use pre-computed cos_sin_cache from RotaryEmbedding
         cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
@@ -733,7 +733,6 @@ class Glm4vVisionTransformer(nn.Module):
         pos_ids = pos_ids.to(cos.device, non_blocking=True)
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
-
         return cos_combined, sin_combined, pos_ids
 
     def compute_attn_mask_seqlen(
@@ -882,9 +881,7 @@ class Glm4vVisionTransformer(nn.Module):
         encoder_metadata: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if encoder_metadata is None:
-            if isinstance(grid_thw, list):
-                grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
-            else:
+            if not isinstance(grid_thw, list):
                 grid_thw = grid_thw.tolist()
             encoder_metadata = self.prepare_encoder_metadata(grid_thw)
 
