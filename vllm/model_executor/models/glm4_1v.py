@@ -1724,7 +1724,7 @@ class Glm4vForConditionalGeneration(
         return "video"
 
     def get_max_frames_per_video(self) -> int:
-        return 1
+        return 0
 
     def get_encoder_cudagraph_budget_range(
         self,
