@@ -143,6 +143,7 @@ class EncoderCudaGraphManager:
         else:
             # Set it to the model-specific value according to its `processing_info`.
             max_frames_per_video = self.model.get_max_frames_per_video()
+            logger.info("====ygr: max_frames_per_video=%s", max_frames_per_video)
             self.max_frames_per_batch = self.max_batch_size * max_frames_per_video
 
         mm_config = vllm_config.model_config.multimodal_config
