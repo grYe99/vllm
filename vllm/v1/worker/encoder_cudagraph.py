@@ -341,9 +341,21 @@ class EncoderCudaGraphManager:
                          always find a valid budget (no miss).
         """
         num_items = self.model.get_encoder_cudagraph_num_items(mm_kwargs)
-        max_budget = self.token_budgets[-1]
-
         per_item_out_tokens = self._get_per_item_out_tokens(mm_kwargs)
+
+        # Log T-check info for debugging
+        if self.max_frames_per_batch > 0:
+            grid_thw_list = self.model._get_grid_thw_by_modality(mm_kwargs)
+            max_replay_frames = max(t for t, h, w in grid_thw_list)
+            logger.error(
+                "====ygr: _execute_local T-check: max_frames_per_batch=%d, "
+                "max_replay_frames=%d, grid_thw_list=%s",
+                self.max_frames_per_batch,
+                max_replay_frames,
+                grid_thw_list,
+            )
+
+        max_budget = self.token_budgets[-1]
 
         # Sort ascending by output token count (smallest first)
         sorted_indices = sorted(range(num_items), key=lambda i: per_item_out_tokens[i])

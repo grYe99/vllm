@@ -1556,6 +1556,17 @@ class SupportsEncoderCudaGraph(Protocol):
         """Return the number of items (e.g. images) in the batch."""
         ...
 
+    def _get_grid_thw_by_modality(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[tuple[int, int, int]]:
+        """Return grid dimensions [T, H, W] for each item by modality.
+
+        Used by T-check fallback to detect if replay frames exceed
+        max_frames_per_batch.
+        """
+        ...
+
     def get_encoder_cudagraph_per_item_output_tokens(
         self,
         mm_kwargs: dict[str, Any],
