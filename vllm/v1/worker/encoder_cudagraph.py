@@ -343,17 +343,34 @@ class EncoderCudaGraphManager:
         num_items = self.model.get_encoder_cudagraph_num_items(mm_kwargs)
         per_item_out_tokens = self._get_per_item_out_tokens(mm_kwargs)
 
-        # Log T-check info for debugging
+        # Check if actual frames per item exceeds capture capacity.
+        # If so, fallback to eager to avoid shape mismatch.
         if self.max_frames_per_batch > 0:
             grid_thw_list = self.model._get_grid_thw_by_modality(mm_kwargs)
             max_replay_frames = max(t for t, h, w in grid_thw_list)
-            logger.error(
-                "====ygr: _execute_local T-check: max_frames_per_batch=%d, "
-                "max_replay_frames=%d, grid_thw_list=%s",
-                self.max_frames_per_batch,
-                max_replay_frames,
-                grid_thw_list,
-            )
+            frames_per_item = self.max_frames_per_batch // self.max_batch_size
+            if max_replay_frames > frames_per_item:
+                logger.error(
+                    "====ygr: T-check fallback to eager: max_replay_frames=%d > "
+                    "frames_per_item=%d, max_frames_per_batch=%d, "
+                    "max_batch_size=%d, grid_thw_list=%s",
+                    max_replay_frames,
+                    frames_per_item,
+                    self.max_frames_per_batch,
+                    self.max_batch_size,
+                    grid_thw_list,
+                )
+                self.graph_misses += num_items
+                eager_outputs: dict[int, torch.Tensor] = {}
+                with torch.inference_mode():
+                    raw = self.model.encoder_eager_forward(mm_kwargs)
+                scatter_output_slices(
+                    raw,
+                    list(range(num_items)),
+                    per_item_out_tokens,
+                    eager_outputs,
+                )
+                return [eager_outputs[i] for i in range(num_items)]
 
         max_budget = self.token_budgets[-1]
 
