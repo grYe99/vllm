@@ -2591,6 +2591,7 @@ def get_multi_modal_input(args):
         needs_metadata = args.model_type in MODELS_NEED_VIDEO_METADATA
         video = VideoAsset(name="baby_reading", num_frames=args.num_frames).np_ndarrays
         metadata = VideoAsset(name="baby_reading", num_frames=args.num_frames).metadata
+        print(f"[YGR] Input video shape: {video.shape}, metadata: {metadata}")
         vid_questions = ["Why is this video funny?"]
 
         return {

@@ -1273,6 +1273,11 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 # Get video grid info for EVS calculation.
                 video_grid_thw = video_outputs["video_grid_thw"]
                 num_frames = int(video_grid_thw[0, 0])
+                logger.error(
+                    "=====ygr hf processor: video_grid_thw=%s, num_frames=%d",
+                    video_grid_thw,
+                    num_frames,
+                )
                 tokens_per_frame_base = int(video_grid_thw[0, 1:].prod()) // (
                     merge_size**2
                 )

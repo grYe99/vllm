@@ -1419,6 +1419,15 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
                 input_ids[input_ids == processor.image_token_id] = (
                     processor.video_token_id
                 )
+                video_grid_thw = video_outputs["video_grid_thw"]
+                num_frames = (
+                    int(video_grid_thw[0, 0]) if video_grid_thw.shape[0] > 0 else 0
+                )
+                logger.error(
+                    "=====ygr hf processor: video_grid_thw=%s, num_frames=%d",
+                    video_grid_thw,
+                    num_frames,
+                )
                 video_placeholder = processor.tokenizer.batch_decode(input_ids)[0]
                 prompt = prompt.replace(
                     "<|begin_of_video|><|video|><|end_of_video|>",
