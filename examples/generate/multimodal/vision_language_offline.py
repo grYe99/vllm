@@ -2101,11 +2101,11 @@ def run_qwen3_vl(questions: list[str], modality: str) -> ModelRequestData:
         model=model_name,
         max_model_len=4096,
         max_num_seqs=5,
-        mm_processor_kwargs={
-            "min_pixels": 28 * 28,
-            "max_pixels": 1280 * 28 * 28,
-            "fps": 1,
-        },
+        # mm_processor_kwargs={
+        #     "min_pixels": 28 * 28,
+        #     "max_pixels": 1280 * 28 * 28,
+        #     "fps": 1,
+        # },
         limit_mm_per_prompt=mm_limit,
     )
 

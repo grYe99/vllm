@@ -1803,7 +1803,7 @@ class Qwen3VLForConditionalGeneration(
 
     def get_max_frames_per_video(self) -> int:
         # forced return 1 to compare
-        return 1
+        # return 1
         mm_registry = MULTIMODAL_REGISTRY
         info = mm_registry.get_processing_info(self.model_config)
         max_frames_per_video = info.get_num_frames_with_most_features(
