@@ -1954,7 +1954,15 @@ class Qwen3VLForConditionalGeneration(
                 [1, spatial_merge_size, per_mm_item_output * spatial_merge_size]
                 for _ in range(max_batch_size)
             ]
-
+        logger.error(
+            "====ygr: capture: frames_per_item=%d, "
+            "max_frames_per_batch=%d, max_batch_size=%d, "
+            "grid_config=%s",
+            frames_per_item,
+            max_frames_per_batch,
+            max_batch_size,
+            grid_config,
+        )
         # Create dummy pixel_values
         patch_embed = self.visual.patch_embed
         in_channels = patch_embed.proj.in_channels
