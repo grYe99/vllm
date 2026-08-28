@@ -1,0 +1,224 @@
+name: Build vLLM Image (self-hosted CN)
+
+on:
+  workflow_dispatch:
+    inputs:
+      torch_cuda_arch_list:
+        description: "CUDA arch list (space separated)"
+        required: false
+        default: "9.0 10.0"
+      target:
+        description: "Dockerfile target stage (build = wheel only, vllm-openai = full runtime image)"
+        required: false
+        default: "build"
+      use_precompiled:
+        description: "Reuse upstream precompiled kernels (skips CUDA compile)"
+        type: boolean
+        required: false
+        default: false
+  # By label, not on every push to a PR: a build occupies the one build
+  # box for 15 minutes at best and hours from cold.
+  pull_request:
+    types: [labeled]
+concurrency:
+  group: selfhosted-docker-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'ci/build-image'
+    runs-on: [self-hosted, vllm-build]
+    timeout-minutes: 480
+    env:
+      # Registry / index mirrors reachable at full speed from CN.
+      # download.pytorch.org measures ~96 KB/s here, mirrors.nju.edu.cn ~5.5 MB/s.
+      # Base images are read out of the Dockerfile at run time and only
+      # re-pointed at the CN mirror, so a pinned tag in the fork is never
+      # silently replaced by upstream's rolling tag.
+      # docker.io -> docker-1ms, ghcr.io -> ghcr-1ms on this registry.
+      # This one is free. It is also slow for the 5.55 GB build base
+      # layer -- measured 870 KB/s here, against 64 KB/s from
+      # docker.m.daocloud.io and 3.98 MB/s from the metered
+      # *.d.1ms.run accelerator. That only bites when the builder has
+      # no copy of the base image: ~2.7 hours cold, nothing at all
+      # once it is in the builder's cache. So keep the free mirror
+      # here, and if the base image tag ever bumps and the wait is not
+      # acceptable, pull that one tag through the accelerator by hand
+      # rather than pointing every build at metered traffic.
+      REGISTRY_MIRROR: release.daocloud.io/docker-1ms
+      # Built images are pushed here and never stored locally; a build-stage
+      # image is tens of GB and this box stores other things. The host is its
+      # own setting so login, logout and the image ref cannot drift apart.
+      REGISTRY: harbor.rundaocloud.com
+      IMAGE_REPO: harbor.rundaocloud.com/inferx/vllm
+      BUILDER: vllm-builder
+      # The box's own Nexus, proxying a CN PyPI mirror. Cached wheels come
+      # back over loopback at ~380 MB/s, and a rebuild no longer depends on
+      # the mirror being reachable.
+      # pypi-group = [pypi-hosted, pypi-public]: the flashinfer wheels seeded
+      # locally, then a CN PyPI mirror for everything else, behind one URL.
+      PIP_INDEX_URL: http://10.20.100.230:8081/repository/pypi-group/simple
+      # Not a PyTorch index, and deliberately a path that 404s. Every CN
+      # PyTorch mirror serves only index HTML, so its nvidia-* entries are
+      # absolute pypi.nvidia.com links, and uv ranks --extra-index-url above
+      # --index-url -- those won at 100 KB/s whatever strategy was set.
+      # requirements pin plain torch==2.13.0, which PyPI already builds
+      # against CUDA 13, so no PyTorch index is needed.
+      # It must 404 cleanly: pointing it at a live Nexus repo made Nexus
+      # answer the bogus /cu130 sub-path with 200 and an HTML error page,
+      # which uv parsed as an index and then hung on the links it found.
+      PYTORCH_CUDA_INDEX_BASE_URL: http://10.20.100.230:8081/repository/pytorch-index-unused
+      # 96 cores: 16 concurrent ninja jobs x 4 nvcc threads, leaves headroom
+      # for the other services on this box. setup.py computes the ninja job
+      # count as max_jobs / nvcc_threads.
+      MAX_JOBS: "64"
+      NVCC_THREADS: "4"
+      # A 9.0 + 10.0 build lands at ~584 MB against upstream's 500 MB default,
+      # which is set for the single-arch wheel that goes to PyPI. Raise it
+      # rather than skip the check, so genuine bloat is still caught.
+      VLLM_MAX_SIZE_MB: "800"
+
+    steps:
+      # Direct GitHub access from this host measures ~66 KB/s, so a full-history
+      # clone is not viable. Shallow is enough: setuptools_scm falls back to a
+      # dev version, and the runner keeps _work between runs so later checkouts
+      # are incremental.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Applied here rather than committed, so the fork stays byte-identical
+      # to upstream and merges cleanly. Both references send uv to GitHub
+      # release assets, which no CN link sustains for a 1 GB wheel -- and uv
+      # installs a batch atomically, so one drop discards everything already
+      # fetched. The wheels are seeded into pypi-hosted instead.
+      # Applied at build time, never committed, so docker/Dockerfile and
+      # requirements/ stay byte-identical to upstream and merges stay clean.
+      - name: Patch build inputs for the local mirrors
+        run: python3 .github/scripts/patch-cn-mirrors.py
+
+      - name: Resolve build parameters
+        id: params
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "arch_list=${{ inputs.torch_cuda_arch_list || '9.0 10.0' }}" >> "$GITHUB_OUTPUT"
+          echo "target=${{ inputs.target || 'build' }}" >> "$GITHUB_OUTPUT"
+          echo "precompiled=${{ inputs.use_precompiled && '1' || '' }}" >> "$GITHUB_OUTPUT"
+          # A PR build is disposable and must not move :latest.
+          if [ "${GITHUB_EVENT_NAME}" = pull_request ]; then
+            echo "tag=${IMAGE_REPO}:pr-${PR_NUMBER}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${IMAGE_REPO}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=--tag=${IMAGE_REPO}:latest" >> "$GITHUB_OUTPUT"
+          fi
+          # Every version comes out of the Dockerfile, so an upstream bump does
+          # not need an edit here. Pinning CUDA_VERSION separately would drift:
+          # the base image would follow the bump while the build arg did not.
+          cuda=$(sed -n 's/^ARG CUDA_VERSION=//p' docker/Dockerfile | head -1)
+          ubuntu=$(sed -n 's/^ARG UBUNTU_VERSION=//p' docker/Dockerfile | head -1)
+          : "${cuda:?could not read ARG CUDA_VERSION from docker/Dockerfile}"
+          : "${ubuntu:?could not read ARG UBUNTU_VERSION from docker/Dockerfile}"
+          echo "cuda_version=${cuda}" >> "$GITHUB_OUTPUT"
+          base=$(sed -n 's/^ARG BUILD_BASE_IMAGE=//p' docker/Dockerfile | head -1)
+          final=$(sed -n 's/^ARG FINAL_BASE_IMAGE=//p' docker/Dockerfile | head -1)
+          final=${final//\$\{CUDA_VERSION\}/$cuda}
+          final=${final//\$\{UBUNTU_VERSION\}/$ubuntu}
+          echo "base_image=${REGISTRY_MIRROR}/${base}" >> "$GITHUB_OUTPUT"
+          echo "final_image=${REGISTRY_MIRROR}/${final}" >> "$GITHUB_OUTPUT"
+          echo "resolved cuda : ${cuda}, ubuntu ${ubuntu}"
+          echo "resolved base : ${REGISTRY_MIRROR}/${base}"
+          echo "resolved final: ${REGISTRY_MIRROR}/${final}"
+
+      - name: Cache state before build
+        run: |
+          df -h / | tail -1
+          docker buildx du --builder "${BUILDER}" 2>/dev/null | tail -1 || true
+
+      # The docker driver cannot push; docker-container can, and its cache
+      # lives in the builder's own volume so it survives between runs.
+      # network=host so the build reaches Nexus on the LAN address.
+      - name: Ensure the builder exists
+        run: |
+          docker buildx inspect "${BUILDER}" >/dev/null 2>&1 ||
+            docker buildx create --name "${BUILDER}" --driver docker-container \
+              --driver-opt network=host --bootstrap
+          docker buildx inspect "${BUILDER}" | grep -E "^(Name|Driver|Status)"
+
+      # Through env, not interpolated into the script: ${{ }} substitutes the
+      # secret as literal text that bash then parses, so a $ in the username or
+      # password is expanded away before docker ever sees it. printf over echo
+      # for the same reason -- no backslash interpretation.
+      - name: Log in to the registry
+        env:
+          REGISTRY_USER: ${{ secrets.RUNDAO_HARBOR_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.RUNDAO_HARBOR_PASSWORD }}
+        run: |
+          # Lengths only -- GitHub masks the values themselves. This tells a
+          # mangled secret (wrong length) apart from a rejected one.
+          echo "user len=${#REGISTRY_USER} pass len=${#REGISTRY_PASS}"
+          case "$REGISTRY_USER" in robot*) echo "user looks like a Harbor robot account" ;; esac
+          # Ask Harbor for a token directly, so docker is out of the picture.
+          code=$(curl -s -o /tmp/tok.json -w '%{http_code}' \
+            -u "$REGISTRY_USER:$REGISTRY_PASS" \
+            "https://${REGISTRY}/service/token?service=harbor-registry&scope=repository:inferx/vllm:pull,push")
+          echo "token endpoint http=$code"
+          if [ "$code" = 200 ]; then
+            python3 -c "import base64,json,sys;t=json.load(open('/tmp/tok.json'))['token'].split('.')[1];t+='='*(-len(t)%4);print('granted:', json.loads(base64.urlsafe_b64decode(t)).get('access'))"
+          fi
+          printf '%s' "$REGISTRY_PASS" |
+            docker login "${REGISTRY}" -u "$REGISTRY_USER" --password-stdin
+
+      # --push streams layers to the registry as they are built, so a
+      # tens-of-GB image never lands on this box at all. --provenance=false
+      # keeps it a plain image rather than a manifest list with attestations.
+      #
+      # Retried because the push died once on "blob upload unknown to
+      # registry" -- the registry not recognising an upload session it had
+      # just handed out, which is what a load balancer without session
+      # affinity in front of several registry replicas looks like. Layers
+      # already accepted are skipped next time and the build is fully cached,
+      # so a retry costs minutes. Three identical failures mean it is not
+      # transient and the registry side needs fixing.
+      - name: Build and push
+        run: |
+          set -o pipefail
+          push() {
+              docker buildx build --builder "${BUILDER}" --push \
+                --provenance=false \
+                --target "${{ steps.params.outputs.target }}" \
+                --tag "${{ steps.params.outputs.tag }}" \
+                ${{ steps.params.outputs.latest_tag }} \
+                --build-arg max_jobs="${MAX_JOBS}" \
+                --build-arg nvcc_threads="${NVCC_THREADS}" \
+                --build-arg torch_cuda_arch_list="${{ steps.params.outputs.arch_list }}" \
+                --build-arg CUDA_VERSION="${{ steps.params.outputs.cuda_version }}" \
+                --build-arg BUILD_BASE_IMAGE="${{ steps.params.outputs.base_image }}" \
+                --build-arg FINAL_BASE_IMAGE="${{ steps.params.outputs.final_image }}" \
+                --build-arg PIP_INDEX_URL="${PIP_INDEX_URL}" \
+                --build-arg PYTORCH_CUDA_INDEX_BASE_URL="${PYTORCH_CUDA_INDEX_BASE_URL}" \
+                --build-arg VLLM_USE_PRECOMPILED="${{ steps.params.outputs.precompiled }}" \
+                --build-arg VLLM_MAX_SIZE_MB="${VLLM_MAX_SIZE_MB}" \
+                --progress plain \
+                -f docker/Dockerfile . 2>&1 |
+                sed -E '/^#[0-9]+ +[0-9.]+ +(copying|creating) /d'
+          }
+          for attempt in 1 2 3; do
+            echo "=== push attempt ${attempt}/3 ==="
+            if push; then exit 0; fi
+            echo "attempt ${attempt} failed"
+            [ "${attempt}" -lt 3 ] && sleep 30
+          done
+          echo "push failed three times; not transient"
+          exit 1
+
+      - name: Report
+        if: always()
+        run: |
+          docker buildx du --builder "${BUILDER}" 2>/dev/null | tail -1 || true
+          df -h / | tail -1
+          docker logout "${REGISTRY}" || true
+
