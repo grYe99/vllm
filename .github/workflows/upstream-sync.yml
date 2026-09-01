@@ -110,31 +110,38 @@ jobs:
 
       # One long-lived PR rather than a new one each day: it retargets itself
       # as the mirror moves, and its diff is always "what upstream added".
+      # REST rather than `gh pr create`: that goes through GraphQL, and a
+      # fine-grained PAT that can push to this repo is still refused there with
+      # "Resource not accessible by personal access token (createPullRequest)".
+      # The REST endpoint accepts the same token.
       - name: Open or refresh the sync PR
         if: steps.merge.outputs.state != 'current'
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
           BEHIND: ${{ steps.merge.outputs.behind }}
         run: |
-          existing=$(gh pr list --base "${OURS}" --head "${MIRROR}" --state open \
-            --json number --jq '.[0].number // empty')
           title="Sync upstream into ${OURS} (${BEHIND} commits behind)"
+          body=$(printf '%s\n' \
+            'Opened by the daily upstream sync.' '' \
+            "\`${MIRROR}\` mirrors vllm-project/vllm@main." '' \
+            'Merge with a **merge commit**. Squashing would make every later' \
+            'sync look like a conflict; rebasing would rewrite the default' \
+            'branch under everyone.' '' \
+            'What we changed relative to upstream, at any time:' '' \
+            '```bash' \
+            "git log --no-merges ${MIRROR}..${OURS}" \
+            "git diff ${MIRROR}...${OURS}" \
+            '```')
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${OURS}&head=${GITHUB_REPOSITORY%%/*}:${MIRROR}" \
+            --jq '.[0].number // empty')
           if [ -n "${existing}" ]; then
-            gh pr edit "${existing}" --title "${title}"
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${existing}" \
+              -f title="${title}" -f body="${body}" --jq '.html_url'
             echo "refreshed PR #${existing}"
           else
-            gh pr create --base "${OURS}" --head "${MIRROR}" --title "${title}" \
-              --body "$(printf '%s\n' \
-                'Opened by the daily upstream sync.' '' \
-                "\`${MIRROR}\` mirrors vllm-project/vllm@main." '' \
-                'Merge with a **merge commit**. Squashing would make every later' \
-                'sync look like a conflict; rebasing would rewrite the default' \
-                'branch under everyone.' '' \
-                'What we changed relative to upstream, at any time:' '' \
-                '```bash' \
-                "git log --no-merges ${MIRROR}..${OURS}" \
-                "git diff ${MIRROR}...${OURS}" \
-                '```')"
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f title="${title}" -f head="${MIRROR}" -f base="${OURS}" -f body="${body}" \
+              --jq '.html_url'
           fi
 
       # Conflicts get an issue rather than a silently red PR, and the same
@@ -159,12 +166,15 @@ jobs:
             '```' '' \
             'If upstream has absorbed one of our changes, `git revert` ours inside' \
             'the merge rather than deleting it, so the history says why it went away.')
-          existing=$(gh issue list --state open --search "${marker} in:body" \
-            --json number --jq '.[0].number // empty')
+          existing=$(gh api -X GET "search/issues" \
+            -f q="repo:${GITHUB_REPOSITORY} is:issue is:open \"${marker}\"" \
+            --jq '.items[0].number // empty')
           if [ -n "${existing}" ]; then
-            gh issue comment "${existing}" --body "${body}"
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" \
+              -f body="${body}" --jq '.html_url'
           else
-            gh issue create --title "Upstream sync conflicts with ${OURS}" --body "${body}"
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" \
+              -f title="Upstream sync conflicts with ${OURS}" -f body="${body}" --jq '.html_url'
           fi
 
       - name: Summary
