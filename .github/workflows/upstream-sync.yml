@@ -1,0 +1,171 @@
+# Keep this fork tracking vllm-project/vllm.
+#
+#   upstream-main  a mirror of upstream's main, force-pushed, never committed
+#                  to by hand. Tags are mirrored with it -- without them
+#                  setuptools-scm has nothing to describe and every wheel comes
+#                  out as 0.1.dev1 instead of a real version.
+#   dc-main        upstream plus our changes; the default branch. Upstream
+#                  lands here through a merge commit, never a rebase, so the
+#                  branch is safe to base work on and
+#                  `git log --no-merges upstream-main..dc-main` stays an honest
+#                  list of what we changed.
+#
+# Hosted runner on purpose: this job only ever talks to github.com, so it has
+# no reason to sit behind the CN mirrors the build runner needs. Running it on
+# the build box needed a CN mirror for the bulk and HTTP/1.1 to stop the packs
+# arriving corrupt -- all of that is unnecessary here.
+name: Sync upstream
+
+on:
+  schedule:
+    # 01:30 UTC = 09:30 CST, so anything broken is waiting when people arrive.
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/vllm-project/vllm.git
+  MIRROR: upstream-main
+  OURS: dc-main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the merge test below needs real ancestry, not a graft.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: dc-main
+
+      - name: Fetch upstream
+        id: up
+        run: |
+          git remote add upstream "${UPSTREAM}"
+          # main and tags in separate commands on purpose. `fetch --tags` leaves
+          # FETCH_HEAD pointing at whichever tag came last, and pushing that by
+          # mistake put the mirror on an ancient release branch once already.
+          git fetch upstream main
+          git fetch --tags upstream
+          sha=$(git rev-parse upstream/main)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "upstream main: ${sha:0:12}"
+          echo "ours:          $(git rev-parse --short HEAD)"
+
+      - name: Mirror upstream into ${{ env.MIRROR }}
+        run: |
+          # Force, because the mirror is defined as "identical to upstream",
+          # not as something with a history of its own to protect.
+          git push --force origin "upstream/main:refs/heads/${MIRROR}"
+          echo "${MIRROR} = $(git rev-parse --short upstream/main)"
+
+      - name: Mirror tags
+        run: |
+          before=$(git ls-remote --tags origin 'refs/tags/v*' | wc -l)
+          git push origin 'refs/tags/*:refs/tags/*' 2>&1 | tail -5 || true
+          after=$(git ls-remote --tags origin 'refs/tags/v*' | wc -l)
+          echo "tags on origin: ${before} -> ${after}"
+          echo "latest: $(git tag --list 'v*' --sort=-creatordate | head -1)"
+
+      - name: Test the merge
+        id: merge
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "state=current" >> "$GITHUB_OUTPUT"
+            echo "${OURS} already contains upstream/main; nothing to do"
+            exit 0
+          fi
+          echo "behind=$(git rev-list --count HEAD..upstream/main)" >> "$GITHUB_OUTPUT"
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if git merge --no-commit --no-ff upstream/main >/dev/null 2>&1; then
+            echo "state=clean" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'conflicts<<CONFLICT_EOF'
+              git diff --name-only --diff-filter=U | head -40
+              echo 'CONFLICT_EOF'
+            } >> "$GITHUB_OUTPUT"
+            echo "state=conflict" >> "$GITHUB_OUTPUT"
+          fi
+          git merge --abort 2>/dev/null || true
+
+      # One long-lived PR rather than a new one each day: it retargets itself
+      # as the mirror moves, and its diff is always "what upstream added".
+      - name: Open or refresh the sync PR
+        if: steps.merge.outputs.state != 'current'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.merge.outputs.behind }}
+        run: |
+          existing=$(gh pr list --base "${OURS}" --head "${MIRROR}" --state open \
+            --json number --jq '.[0].number // empty')
+          title="Sync upstream into ${OURS} (${BEHIND} commits behind)"
+          if [ -n "${existing}" ]; then
+            gh pr edit "${existing}" --title "${title}"
+            echo "refreshed PR #${existing}"
+          else
+            gh pr create --base "${OURS}" --head "${MIRROR}" --title "${title}" \
+              --body "$(printf '%s\n' \
+                'Opened by the daily upstream sync.' '' \
+                "\`${MIRROR}\` mirrors vllm-project/vllm@main." '' \
+                'Merge with a **merge commit**. Squashing would make every later' \
+                'sync look like a conflict; rebasing would rewrite the default' \
+                'branch under everyone.' '' \
+                'What we changed relative to upstream, at any time:' '' \
+                '```bash' \
+                "git log --no-merges ${MIRROR}..${OURS}" \
+                "git diff ${MIRROR}...${OURS}" \
+                '```')"
+          fi
+
+      # Conflicts get an issue rather than a silently red PR, and the same
+      # issue is reused so a bad week is one thread instead of seven.
+      - name: Report conflicts
+        if: steps.merge.outputs.state == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.merge.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          marker='<!-- upstream-sync-conflict -->'
+          body=$(printf '%s\n' "${marker}" \
+            "Merging \`${MIRROR}\` into \`${OURS}\` conflicts. Upstream is ${BEHIND} commits ahead." '' \
+            'Conflicting files:' '```' "${CONFLICTS}" '```' '' \
+            'To resolve:' '```bash' \
+            'git fetch origin' \
+            "git switch ${OURS} && git pull" \
+            "git merge origin/${MIRROR}" \
+            '# fix, then' \
+            'git commit && git push' \
+            '```' '' \
+            'If upstream has absorbed one of our changes, `git revert` ours inside' \
+            'the merge rather than deleting it, so the history says why it went away.')
+          existing=$(gh issue list --state open --search "${marker} in:body" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh issue create --title "Upstream sync conflicts with ${OURS}" --body "${body}"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream | \`${{ steps.up.outputs.sha }}\` |"
+            echo "| state | ${{ steps.merge.outputs.state || 'n/a' }} |"
+            echo "| behind | ${{ steps.merge.outputs.behind || 0 }} |"
+            echo "| latest tag | \`$(git tag --list 'v*' --sort=-creatordate | head -1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
