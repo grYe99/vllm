@@ -1,0 +1,110 @@
+# A running list of what this fork carries on top of upstream.
+#
+# `git log --no-merges upstream-main..dc-main` already answers "what did we
+# change" mechanically, but it cannot answer the question that actually comes
+# up: is this one still needed, or has upstream since done the same thing? Git
+# cannot see that -- upstream solving the same problem differently produces no
+# relationship between the commits. So the log is appended to automatically and
+# the judgement is left to a checkbox a person ticks.
+#
+# One issue, never closed, task list newest first. Tick an entry when upstream
+# has absorbed it or you have reverted it; what stays unticked is what we are
+# still carrying.
+name: Record merged changes
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  # Serialised: two merges landing together would otherwise read the same body
+  # and the second would overwrite the first's entry.
+  group: dc-changes-log
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # The sync PR is upstream arriving, not a change of ours.
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref != 'upstream-main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append to the log
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, datetime
+
+          repo = os.environ['REPO']
+          marker = '<!-- dc-changes-log -->'
+
+          def gh(*args, **kw):
+              return subprocess.run(['gh', *args], capture_output=True, text=True, **kw)
+
+          header = f"""{marker}
+          What this fork carries on top of upstream.
+
+          `upstream-main` mirrors vllm-project/vllm@main; `{os.environ['PR_BASE']}` is that
+          plus the entries below. To see the delta at any time:
+
+          ```bash
+          git log --no-merges upstream-main..{os.environ['PR_BASE']}
+          git diff upstream-main...{os.environ['PR_BASE']}
+          ```
+
+          **Tick an entry** once upstream has absorbed it or you have reverted it --
+          git cannot tell that on its own. What stays unticked is what we still carry.
+          To drop one, `git revert` the commit rather than deleting it, so the history
+          says why it went away.
+
+          ## Merged
+          """
+
+          found = gh('api', '-X', 'GET', 'search/issues',
+                     '-f', f'q=repo:{repo} is:issue is:open "{marker}"',
+                     '--jq', '.items[0].number // empty')
+          number = found.stdout.strip()
+
+          entry = (
+              f"- [ ] #{os.environ['PR_NUMBER']} {os.environ['PR_TITLE']}\n"
+              f"      merged {datetime.date.today().isoformat()}"
+              f" · `{os.environ['PR_SHA'][:12]}` · @{os.environ['PR_USER']}"
+          )
+
+          if not number:
+              body = header + "\n" + entry + "\n"
+              r = gh('api', '-X', 'POST', f'repos/{repo}/issues',
+                     '-f', 'title=Changes this fork carries on top of upstream',
+                     '-f', f'body={body}', '--jq', '.number')
+              print('created issue', r.stdout.strip() or r.stderr)
+              raise SystemExit(0 if r.returncode == 0 else 1)
+
+          cur = gh('api', f'repos/{repo}/issues/{number}', '--jq', '.body').stdout
+          if f"#{os.environ['PR_NUMBER']} " in cur:
+              print(f"PR #{os.environ['PR_NUMBER']} already recorded in #{number}")
+              raise SystemExit(0)
+
+          anchor = '## Merged'
+          if anchor in cur:
+              head, _, tail = cur.partition(anchor)
+              body = f"{head}{anchor}\n{entry}{tail}"
+          else:
+              body = cur.rstrip() + '\n\n' + anchor + '\n' + entry + '\n'
+
+          r = gh('api', '-X', 'PATCH', f'repos/{repo}/issues/{number}',
+                 '-f', f'body={body}', '--jq', '.html_url')
+          print('updated', r.stdout.strip() or r.stderr)
+          raise SystemExit(0 if r.returncode == 0 else 1)
+          PY
