@@ -41,10 +41,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Full history: the merge test below needs real ancestry, not a graft.
+      #
+      # A PAT rather than the default token: upstream's commits touch files
+      # under .github/workflows, and GITHUB_TOKEN is refused on those --
+      # "refusing to allow a GitHub App to create or update workflow ...
+      # without `workflows` permission". There is no `workflows:` entry that
+      # can be granted in this file; only a PAT or App token carries it.
+      # Checking out with it also leaves origin configured to push with it.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: dc-main
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          persist-credentials: true
 
       - name: Fetch upstream
         id: up
@@ -104,7 +113,7 @@ jobs:
       - name: Open or refresh the sync PR
         if: steps.merge.outputs.state != 'current'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
           BEHIND: ${{ steps.merge.outputs.behind }}
         run: |
           existing=$(gh pr list --base "${OURS}" --head "${MIRROR}" --state open \
@@ -133,7 +142,7 @@ jobs:
       - name: Report conflicts
         if: steps.merge.outputs.state == 'conflict'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
           BEHIND: ${{ steps.merge.outputs.behind }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
         run: |
