@@ -192,7 +192,16 @@ def main() -> int:
         flags=re.M,
     )
     dockerfile = re.sub(
-        r"--index-url https://flashinfer\.ai/whl/cu[^\n]*",
+        # Just the URL. Two things make this fiddly: the URL ends in a shell
+        # substitution that contains spaces, and what follows it on the line
+        # matters. [^\n]* used to run to end of line and ate the "; \\" that
+        # continues the RUN -- harmless while the flag ended a line, fatal once
+        # upstream moved it inside an if/fi, because `fi` then became a Docker
+        # instruction. \S* is no better: it stops at the first space, which is
+        # inside $(...), leaving half the substitution stranded. So: consume
+        # balanced $(...) groups whole, otherwise anything that is not a space,
+        # a semicolon or a backslash.
+        r"--index-url https://flashinfer\.ai/whl/cu(?:\$\([^)]*\)|[^\s;\\])*",
         "--index-url " + NEXUS,
         dockerfile,
     )
