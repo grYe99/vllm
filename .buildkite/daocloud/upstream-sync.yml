@@ -1,0 +1,35 @@
+# Keeps this fork tracking vllm-project/vllm. Ours, not upstream's -- kept in
+# its own directory so it can never collide with a file upstream adds.
+#
+# On Buildkite rather than GitHub Actions because the org's Actions quota gets
+# taken by the open-source repos, leaving this one starved. Buildkite's hosted
+# agents also start scheduled builds on time; GitHub was running this 5-6 hours
+# late, measured against stale.yml sharing the same 01:30 UTC slot.
+#
+# Set up in Buildkite (not in this file):
+#   Pipeline    steps from .buildkite/daocloud/upstream-sync.yml
+#   Schedule    30 1 * * *  on dc-main
+#   Secret      UPSTREAM_SYNC_TOKEN -- a fine-grained PAT on this repo with
+#               Contents, Workflows, Pull requests and Issues read+write.
+#               Workflows is not optional: upstream's commits touch
+#               .github/workflows, and a token without it is refused.
+steps:
+  - label: ":arrows_counterclockwise: sync upstream"
+    key: sync
+    # This pipeline has one job and one trigger. Connecting a pipeline to a
+    # GitHub repo makes Buildkite build every push and every pull request by
+    # default, which puts a red check on PRs that have nothing to do with the
+    # sync. Turning that off belongs in the pipeline's GitHub settings; this is
+    # the guard for when it is not, or is switched back on later.
+    if: build.source == "schedule" || build.source == "ui" || build.source == "api"
+    branches: "dc-main"
+    command: .buildkite/daocloud/upstream-sync.sh
+    # The merge test needs real ancestry, and the mirror push needs the objects.
+    env:
+      BUILDKITE_GIT_CLONE_FLAGS: "-v"
+      BUILDKITE_GIT_FETCH_FLAGS: "-v --tags"
+    timeout_in_minutes: 30
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
