@@ -124,12 +124,39 @@ RUST_SETUP = (
 )
 
 
+def stage_parents(dockerfile: str) -> dict[str, str]:
+    """Map each stage to the stage it is built FROM, where that is one."""
+    names, parents = set(), {}
+    for line in dockerfile.splitlines():
+        if line.startswith("FROM ") and " AS " in line:
+            base, name = line[5:].rsplit(" AS ", 1)
+            base, name = base.strip(), name.strip()
+            if base in names:
+                parents[name] = base
+            names.add(name)
+    return parents
+
+
 def stage_has(dockerfile: str, stage: str, prefix: str) -> bool:
+    """Whether the stage declares the line, or inherits it from an ancestor.
+
+    ENV crosses a FROM, so asking only about the named stage gives the wrong
+    answer: upstream split the Rust build into rust-build-cache and a
+    rust-build built FROM it, and the settings that land in the parent are in
+    force in the child even though the child never mentions them.
+    """
+    parents = stage_parents(dockerfile)
+    wanted, seen = set(), set()
+    while stage and stage not in seen:
+        seen.add(stage)
+        wanted.add(stage)
+        stage = parents.get(stage)
+
     current = None
     for line in dockerfile.splitlines():
         if line.startswith("FROM ") and " AS " in line:
             current = line.rsplit(" AS ", 1)[1].strip()
-        elif current == stage and line.startswith(prefix):
+        elif current in wanted and line.startswith(prefix):
             return True
     return False
 
