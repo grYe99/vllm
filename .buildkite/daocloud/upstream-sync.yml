@@ -16,6 +16,13 @@
 steps:
   - label: ":arrows_counterclockwise: sync upstream"
     key: sync
+    # This pipeline has one job and one trigger. Connecting a pipeline to a
+    # GitHub repo makes Buildkite build every push and every pull request by
+    # default, which puts a red check on PRs that have nothing to do with the
+    # sync. Turning that off belongs in the pipeline's GitHub settings; this is
+    # the guard for when it is not, or is switched back on later.
+    if: build.source == "schedule" || build.source == "ui" || build.source == "api"
+    branches: "dc-main"
     command: .buildkite/daocloud/upstream-sync.sh
     # The merge test needs real ancestry, and the mirror push needs the objects.
     env:
