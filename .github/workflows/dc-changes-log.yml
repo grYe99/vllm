@@ -72,6 +72,18 @@ jobs:
           ## Merged
           """
 
+          # CI plumbing is not what this list is for. It is here to answer
+          # "has upstream absorbed this yet, and can we drop it" -- a question
+          # that only applies to changes to vLLM itself. A PR confined to
+          # .github/ is our build setup and will never be absorbed upstream, so
+          # recording it only buries the entries that matter. Decided by path
+          # rather than a label, because a label depends on someone remembering.
+          files = gh('api', '--paginate', f'repos/{repo}/pulls/{os.environ["PR_NUMBER"]}/files',
+                     '--jq', '.[].filename').stdout.split()
+          if files and all(f.startswith('.github/') for f in files):
+              print(f"PR #{os.environ['PR_NUMBER']} only touches .github/; not recording")
+              raise SystemExit(0)
+
           found = gh('api', '-X', 'GET', 'search/issues',
                      '-f', f'q=repo:{repo} is:issue is:open "{marker}"',
                      '--jq', '.items[0].number // empty')
