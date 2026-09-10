@@ -21,8 +21,12 @@ steps:
     # default, which puts a red check on PRs that have nothing to do with the
     # sync. Turning that off belongs in the pipeline's GitHub settings; this is
     # the guard for when it is not, or is switched back on later.
-    if: build.source == "schedule" || build.source == "ui" || build.source == "api"
-    branches: "dc-main"
+    # One conditional, not two: Buildkite rejects a step carrying both `if`
+    # and `branches` ("You can't have both a `branches` and `if` conditional
+    # on the same step"), so the branch check lives inside the expression.
+    if: >-
+      build.branch == "dc-main" &&
+      (build.source == "schedule" || build.source == "ui" || build.source == "api")
     command: .buildkite/daocloud/upstream-sync.sh
     # The merge test needs real ancestry, and the mirror push needs the objects.
     env:
