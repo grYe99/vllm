@@ -17,17 +17,36 @@ if [ -z "$TOKEN" ] && command -v buildkite-agent >/dev/null 2>&1; then
 fi
 [ -n "$TOKEN" ] || { echo "UPSTREAM_SYNC_TOKEN is not set"; exit 1; }
 
+# Body on stdout; anything but 2xx prints what GitHub said and fails the build.
+# Without this the script reported "refreshed PR #28" whether or not the call
+# worked -- the PR sat two weeks out of date behind a green build.
 api() {  # method path [json]
-  local method=$1 path=$2 data=${3:-}
+  local method=$1 path=$2 data=${3:-} out status body
   if [ -n "$data" ]; then
-    curl -sS -X "$method" -H "Authorization: Bearer $TOKEN" \
-      -H "Accept: application/vnd.github+json" -d "$data" "$API/$path"
+    out=$(curl -sS -w '\n%{http_code}' -X "$method" -H "Authorization: Bearer $TOKEN" \
+      -H "Accept: application/vnd.github+json" -d "$data" "$API/$path")
   else
-    curl -sS -X "$method" -H "Authorization: Bearer $TOKEN" \
-      -H "Accept: application/vnd.github+json" "$API/$path"
+    out=$(curl -sS -w '\n%{http_code}' -X "$method" -H "Authorization: Bearer $TOKEN" \
+      -H "Accept: application/vnd.github+json" "$API/$path")
   fi
+  status=${out##*$'\n'}
+  body=${out%$'\n'*}
+  case "$status" in
+    2*) printf '%s' "$body" ;;
+    *)  { echo "GitHub API $method $path -> HTTP $status"
+          printf '%s' "$body" | head -c 600; echo; } >&2
+        return 1 ;;
+  esac
 }
-jget() { python3 -c 'import json,sys;d=json.load(sys.stdin);print(eval(sys.argv[1],{},{"d":d}) or "")' "$1"; }
+# Tolerates empty input: when api() has already reported a failure, a decode
+# traceback on top of it is noise that buries the message that matters.
+jget() { python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    sys.exit(0)
+d = json.loads(raw)
+print(eval(sys.argv[1], {}, {"d": d}) or "")' "$1"; }
 jstr() { python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'; }
 
 git config user.name  'buildkite[bot]'
@@ -81,15 +100,17 @@ echo "--- opening or refreshing the sync PR"
 OWNER=${REPO%%/*}
 EXISTING=$(api GET "repos/${REPO}/pulls?state=open&base=${OURS}&head=${OWNER}:${MIRROR}" \
            | jget 'd[0]["number"] if d else ""')
-PAYLOAD=$(python3 -c '
+jpayload() { python3 -c '
 import json,sys
-print(json.dumps({"title": sys.argv[1], "body": sys.argv[2], "head": sys.argv[3], "base": sys.argv[4]}))
-' "$TITLE" "$BODY" "$MIRROR" "$OURS")
+print(json.dumps(dict(zip(sys.argv[1::2], sys.argv[2::2]))))
+' "$@"; }
 if [ -n "$EXISTING" ]; then
-  api PATCH "repos/${REPO}/pulls/${EXISTING}" "$PAYLOAD" | jget 'd.get("html_url")'
+  api PATCH "repos/${REPO}/pulls/${EXISTING}" \
+    "$(jpayload title "$TITLE" body "$BODY")" | jget 'd["html_url"]'
   echo "refreshed PR #${EXISTING}"
 else
-  api POST "repos/${REPO}/pulls" "$PAYLOAD" | jget 'd.get("html_url") or d.get("message")'
+  api POST "repos/${REPO}/pulls" \
+    "$(jpayload title "$TITLE" body "$BODY" head "$MIRROR" base "$OURS")" | jget 'd["html_url"]'
 fi
 
 [ "$STATE" = conflict ] || { echo "--- merge is clean"; exit 0; }
