@@ -155,9 +155,12 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
-                pos_emb_3d = (
-                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
-                )
+                # time_weight is stored in fp32 for sincos precision; cast to the
+                # spatial emb dtype so video (t>1) does not promote activations
+                # to float32 and break bf16 Linear/LayerNorm in the tower.
+                pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
+                    0:t
+                ].to(dtype=pos_emb_2d.dtype)
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
@@ -166,7 +169,7 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
     def forward(
         self, x: torch.Tensor, grid_thws: torch.Tensor | list[list[int]]
     ) -> torch.Tensor:
-        return x + self.get_pos_embeds(grid_thws)
+        return x + self.get_pos_embeds(grid_thws).to(dtype=x.dtype)
 
 
 class MoonVision3dPatchEmbed(nn.Module):

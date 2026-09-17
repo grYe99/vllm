@@ -207,6 +207,21 @@ class KimiK25FusedVisionProcessor(BaseImageProcessor):
         if media_input["type"] == "video_chunk":
             frame = media_input["video_chunk"][0]
             width, height = frame.size
+            # Prefer the per-frame budget attached by split_video_chunks
+            # (global in_patch_limit_video / sampled_frames). Fall back to
+            # dividing the video budget by this chunk's frame count.
+            chunk_limit = media_input.get("in_patch_limit")
+            if chunk_limit is not None:
+                return navit_resize_image(
+                    width,
+                    height,
+                    self.media_proc_cfg["patch_size"],
+                    self.media_proc_cfg["merge_kernel_size"],
+                    int(chunk_limit),
+                    self.media_proc_cfg["patch_limit_on_one_side"],
+                    self.media_proc_cfg["fixed_output_tokens"],
+                )
+
             num_frames = len(media_input["video_chunk"])
             in_patch_limit_each_frame = self.media_proc_cfg["in_patch_limit_each_frame"]
             if in_patch_limit_each_frame is None:

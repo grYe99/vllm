@@ -94,6 +94,7 @@ class KimiK3Config(PretrainedConfig):
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         image_placeholder: str = "<|kimi_image_placeholder|>",
+        video_placeholder: str = "<|kimi_k3_video_placeholder|>",
         **kwargs,
     ):
         if text_config is None:
@@ -124,6 +125,7 @@ class KimiK3Config(PretrainedConfig):
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder
+        self.video_placeholder = video_placeholder
 
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config

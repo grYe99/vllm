@@ -7,17 +7,17 @@ from vllm.tokenizers.hf import HfTokenizer
 
 
 class KimiK3Processor(ProcessorMixin):
-    """HF-style processor wrapper for the image-only Kimi-K3 model.
+    """HF-style processor wrapper for Kimi-K3 images and optional videos.
 
-    K3 exposes the standard ``image`` modality, so vLLM calls this processor
-    with ``images=[PIL, ...]``. The underlying checkpoint image processor
-    (``KimiK3VisionProcessor``) works on ``{"type": "image", "image": PIL}``
-    media dicts, so this wrapper adapts bare PIL images into that shape before
-    delegating to ``preprocess``.
+    The image path is unchanged: ``images=[PIL, ...]`` is adapted into
+    ``{"type": "image", "image": PIL}`` media dicts for the checkpoint image
+    processor and returns ``pixel_values`` / ``grid_thws``.
 
-    Text is only tokenized here; the single ``<|kimi_image_placeholder|>``
-    token per image is expanded into the resolution-aware media block by the
-    model's ``_get_prompt_updates`` on the vLLM side.
+    Video is an additive side path. Callers pass already-split MoonViT3d
+    ``video_chunk`` media dicts via ``videos=``. Those are preprocessed with the
+    fused/local video-capable processor and returned under separate keys
+    (``video_pixel_values`` / ``video_grid_thws``) so the image tensors stay
+    untouched.
     """
 
     attributes = ["image_processor", "tokenizer"]
@@ -26,27 +26,45 @@ class KimiK3Processor(ProcessorMixin):
         self,
         image_processor: BaseImageProcessor,
         tokenizer: HfTokenizer,
+        video_processor: BaseImageProcessor | None = None,
     ) -> None:
         self.image_processor = image_processor
         self.tokenizer = tokenizer
+        # Optional video-capable processor (typically fused MoonViT preprocess).
+        # Falls back to image_processor when it already understands video_chunk.
+        self.video_processor = video_processor or image_processor
 
     def __call__(
         self,
         text: str | list[str] | None = None,
         images: object | list[object] | None = None,
+        videos: list[dict] | None = None,
         return_tensors: str | TensorType | None = None,
         **kwargs,
     ) -> BatchFeature:
+        mm_inputs: dict = {}
+
         if images is not None:
             if not isinstance(images, list):
                 images = [images]
             medias = [{"type": "image", "image": image} for image in images]
-            mm_inputs = self.image_processor.preprocess(
+            image_inputs = self.image_processor.preprocess(
                 medias,
                 return_tensors=return_tensors,
             )
-        else:
-            mm_inputs = {}
+            mm_inputs.update(dict(image_inputs))
+
+        if videos is not None:
+            video_inputs = self.video_processor.preprocess(
+                videos,
+                return_tensors=return_tensors,
+            )
+            # Keep video tensors on a separate key namespace so image fields
+            # (pixel_values / grid_thws) are never overwritten or reshaped.
+            if "pixel_values" in video_inputs:
+                mm_inputs["video_pixel_values"] = video_inputs["pixel_values"]
+            if "grid_thws" in video_inputs:
+                mm_inputs["video_grid_thws"] = video_inputs["grid_thws"]
 
         if text is not None:
             if not isinstance(text, list):

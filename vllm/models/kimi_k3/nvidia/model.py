@@ -1786,6 +1786,8 @@ class KimiK3ForConditionalGeneration(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
             return "<|kimi_image_placeholder|>"
+        if modality == "video":
+            return "<|kimi_k3_video_placeholder|>"
         raise ValueError(f"Unsupported modality: {modality}")
 
     def __init__(
@@ -1808,7 +1810,7 @@ class KimiK3ForConditionalGeneration(
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
-        with self._mark_tower_model(vllm_config, "image"):
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.vision_tower = MoonViT3dPretrainedModel(
                 config.vision_config,
                 quant_config=self._maybe_ignore_quant_config(quant_config),
@@ -1880,7 +1882,7 @@ class KimiK3ForConditionalGeneration(
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
         return EncoderCudaGraphConfig(
-            modalities=["image"],
+            modalities=["image", "video"],
             buffer_keys=[
                 "pixel_values",
                 "pos_embeds",
@@ -1905,14 +1907,18 @@ class KimiK3ForConditionalGeneration(
 
     @staticmethod
     def _get_grid_thws(mm_kwargs: dict[str, Any]) -> list[list[int]]:
-        grid_thws = mm_kwargs["grid_thws"]
+        grid_thws = mm_kwargs.get("grid_thws")
+        if grid_thws is None:
+            grid_thws = mm_kwargs["video_grid_thws"]
         if not isinstance(grid_thws, list):
             grid_thws = grid_thws.tolist()
         return grid_thws
 
     @staticmethod
     def _get_pixel_values(mm_kwargs: dict[str, Any]) -> torch.Tensor:
-        pixel_values = mm_kwargs["pixel_values"]
+        pixel_values = mm_kwargs.get("pixel_values")
+        if pixel_values is None:
+            pixel_values = mm_kwargs["video_pixel_values"]
         if isinstance(pixel_values, list):
             pixel_values = torch.cat(pixel_values)
         if pixel_values.ndim in (3, 5):
@@ -1926,26 +1932,37 @@ class KimiK3ForConditionalGeneration(
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
         kh, kw = self.config.vision_config.merge_kernel_size
-        return [
-            EncoderItemSpec(
-                input_size=t * h * w,
-                output_tokens=(h // kh) * (w // kw),
-            )
-            for t, h, w in self._get_grid_thws(mm_kwargs)
-        ]
+        specs = []
+        for t, h, w in self._get_grid_thws(mm_kwargs):
+            if t != 1:
+                # Video chunks not supported in encoder CUDA graph;
+                # sentinel forces eager fallback via the manager.
+                specs.append(
+                    EncoderItemSpec(input_size=t * h * w, output_tokens=2**30)
+                )
+            else:
+                specs.append(
+                    EncoderItemSpec(
+                        input_size=h * w,
+                        output_tokens=(h // kh) * (w // kw),
+                    )
+                )
+        return specs
 
     def select_encoder_cudagraph_items(
         self, mm_kwargs: dict[str, Any], indices: list[int]
     ) -> dict[str, Any]:
         grid_thws = self._get_grid_thws(mm_kwargs)
         pixel_values = self._get_pixel_values(mm_kwargs)
-        source_grid = mm_kwargs["grid_thws"]
+        pv_key = "pixel_values" if "pixel_values" in mm_kwargs else "video_pixel_values"
+        grid_key = "grid_thws" if "grid_thws" in mm_kwargs else "video_grid_thws"
+        source_grid = mm_kwargs[grid_key]
 
         if not indices:
             empty_grid = (
                 source_grid[:0] if isinstance(source_grid, torch.Tensor) else []
             )
-            return {"pixel_values": pixel_values[:0], "grid_thws": empty_grid}
+            return {pv_key: pixel_values[:0], grid_key: empty_grid}
 
         patch_counts = [t * h * w for t, h, w in grid_thws]
         offsets = [0]
@@ -1962,7 +1979,7 @@ class KimiK3ForConditionalGeneration(
             dtype=torch.long,
             device=grid_device,
         )
-        return {"pixel_values": selected_pixel_values, "grid_thws": selected_grid}
+        return {pv_key: selected_pixel_values, grid_key: selected_grid}
 
     def prepare_encoder_cudagraph_capture_inputs(
         self,
@@ -2084,6 +2101,11 @@ class KimiK3ForConditionalGeneration(
     ) -> KimiK25MediaPixelInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         grid_thws = kwargs.pop("grid_thws", None)
+        # Additive video path uses separate tensor keys so image kwargs stay
+        # untouched when both modalities are present in a request.
+        if pixel_values is None:
+            pixel_values = kwargs.pop("video_pixel_values", None)
+            grid_thws = kwargs.pop("video_grid_thws", None)
         if pixel_values is None:
             return None
 

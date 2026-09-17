@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared Kimi-K3 multimodal preprocessing."""
 
+from __future__ import annotations
+
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
+import numpy as np
 import torch
+from PIL import Image
 from transformers import BatchFeature
 
 from vllm.config.multimodal import BaseDummyOptions, ImageDummyOptions
@@ -16,7 +20,13 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import ImageProcessorItems, ImageSize, MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageProcessorItems,
+    ImageSize,
+    MultiModalDataItems,
+    MultiModalDataParser,
+    ProcessorBatchItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -29,7 +39,11 @@ from vllm.multimodal.processing import (
 )
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.processor import cached_get_image_processor
+from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
+    KimiK25FusedVisionProcessor,
+)
 from vllm.transformers_utils.processors.kimi_k3 import KimiK3Processor
+from vllm.utils.import_utils import is_numba_available
 
 logger = init_logger(__name__)
 
@@ -87,13 +101,119 @@ def navit_resize_image(
     }
 
 
-class KimiK3ProcessingInfo(BaseProcessingInfo):
-    """Processing information for the image-only Kimi-K3 model.
+def timestamp_as_str(timestamp: float, mode: str = "hh:mm:ss.fff") -> str:
+    """Format a video timestamp for chunk prompts (HF discussion #172)."""
+    if timestamp < 0:
+        timestamp = 0.0
+    total_ms = int(round(timestamp * 1000.0))
+    hours, rem_ms = divmod(total_ms, 3_600_000)
+    minutes, rem_ms = divmod(rem_ms, 60_000)
+    seconds, millis = divmod(rem_ms, 1000)
+    if mode == "hh:mm:ss":
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if mode == "mm:ss.fff":
+        return f"{minutes + hours * 60:02d}:{seconds:02d}.{millis:03d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
 
-    K3 uses the standard ``image`` modality (unlike K2.5's unified
-    ``vision_chunk``), so it builds its own ``KimiK3Processor`` wrapper around
-    the checkpoint's image processor and resolves the ``<|media_pad|>`` token
-    id the same way K2.5 does.
+
+def make_video_chunk_prompt(timestamp_text: str) -> str:
+    """Build one timestamped K3 video-chunk placeholder."""
+    return (
+        f"{timestamp_text}<|media_begin|>video<|media_content|>"
+        f"<|media_pad|><|media_end|>"
+    )
+
+
+def frames_from_video_data(video_data: Any) -> tuple[list[Image.Image], list[float]]:
+    """Normalize connector / ndarray / PIL video payloads into RGB frames."""
+    meta: dict[str, Any] = {}
+    if hasattr(video_data, "media"):
+        video_data = video_data.media
+
+    if isinstance(video_data, tuple) and len(video_data) >= 1:
+        frames_data = video_data[0]
+        if len(video_data) >= 2 and isinstance(video_data[1], dict):
+            meta = video_data[1]
+    else:
+        frames_data = video_data
+
+    if isinstance(frames_data, torch.Tensor):
+        frames_data = frames_data.detach().cpu().numpy()
+
+    frames: list[Image.Image] = []
+    if isinstance(frames_data, np.ndarray):
+        if frames_data.ndim == 3:
+            frames_data = frames_data[None, ...]
+        if frames_data.ndim != 4:
+            raise ValueError(
+                f"Expected video frames with shape (T,H,W,C), got {frames_data.shape}"
+            )
+        for frame in frames_data:
+            arr = np.asarray(frame)
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            frames.append(Image.fromarray(arr).convert("RGB"))
+    elif isinstance(frames_data, (list, tuple)):
+        for frame in frames_data:
+            if isinstance(frame, Image.Image):
+                frames.append(frame.convert("RGB"))
+            elif isinstance(frame, np.ndarray):
+                arr = np.asarray(frame)
+                if arr.dtype != np.uint8:
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+                frames.append(Image.fromarray(arr).convert("RGB"))
+            else:
+                raise ValueError(f"Unsupported video frame type: {type(frame)}")
+    else:
+        raise ValueError(f"Unsupported video data type: {type(frames_data)}")
+
+    if not frames:
+        raise ValueError("Video sampling did not return any frames.")
+
+    timestamps: list[float] = []
+    frame_indices = meta.get("frames_indices") or meta.get("frame_indices")
+    fps = float(meta.get("fps") or meta.get("avg_fps") or 0.0)
+    if frame_indices is not None and fps > 0:
+        timestamps = [float(idx) / fps for idx in frame_indices]
+    elif fps > 0:
+        timestamps = [i / fps for i in range(len(frames))]
+    else:
+        timestamps = [float(i) for i in range(len(frames))]
+
+    if len(timestamps) < len(frames):
+        timestamps.extend(float(i) for i in range(len(timestamps), len(frames)))
+    return frames, timestamps[: len(frames)]
+
+
+class KimiK3VideoChunkItems(ProcessorBatchItems[dict[str, Any]]):
+    """Processor items for already-split K3 video chunks under modality video."""
+
+    def __init__(self, data: Sequence[dict[str, Any]]) -> None:
+        super().__init__(data, "video")
+
+    def get_processor_data(self) -> Mapping[str, object]:
+        return {"videos": list(self.data)}
+
+
+class KimiK3DataParser(MultiModalDataParser):
+    """Like the default parser, but accepts pre-split video_chunk dicts."""
+
+    def _parse_video_data(self, data) -> ProcessorBatchItems | None:
+        if data is None:
+            return None
+        if self.is_embeddings(data):
+            return super()._parse_video_data(data)
+        items = data if isinstance(data, list) else [data]
+        if items and isinstance(items[0], dict) and items[0].get("type") == "video_chunk":
+            return KimiK3VideoChunkItems(items)
+        return super()._parse_video_data(data)
+
+
+class KimiK3ProcessingInfo(BaseProcessingInfo):
+    """Processing information for Kimi-K3.
+
+    Images keep the original ``image`` modality path. Video is an optional
+    additive ``video`` modality that consumes pre-split MoonViT3d chunks.
     """
 
     def __init__(self, ctx: InputProcessingContext) -> None:
@@ -134,11 +254,34 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         self.media_token = tokenizer.decode(media_token_id)
 
         self.image_processor = image_processor
+
+        # Video uses the fused MoonViT preprocess when numba is available so we
+        # do not depend on unmerged HF remote video code for the image path.
+        self.video_processor: Any = image_processor
+        if is_numba_available():
+            try:
+                self.video_processor = KimiK25FusedVisionProcessor(
+                    media_proc_cfg=dict(image_processor.media_proc_cfg)
+                )
+            except Exception:
+                logger.warning_once(
+                    "Failed to build fused video processor for Kimi-K3; "
+                    "video inputs will require a video-capable image processor."
+                )
+                self.video_processor = image_processor
+
         self.hf_processor = KimiK3Processor(
             tokenizer=tokenizer,
             image_processor=image_processor,
+            video_processor=self.video_processor,
         )
         self.media_tokens_calculator = image_processor.media_tokens_calculator
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        return KimiK3DataParser(
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
 
     def get_hf_processor(self, **kwargs: object) -> KimiK3Processor:
         return self.hf_processor
@@ -147,8 +290,8 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(KimiK3Config)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # None means unlimited
-        return {"image": None}
+        # None means unlimited. Image path unchanged; video is additive.
+        return {"image": None, "video": None}
 
     @classmethod
     def get_max_image_size(
@@ -189,16 +332,22 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
 
 
 class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
-    """Builds image-based dummy inputs for K3 profiling.
+    """Builds dummy inputs for K3 profiling.
 
-    The dummy text is made of ``<|kimi_image_placeholder|>`` tokens — exactly
-    the placeholder that K3's ``_get_prompt_updates`` expands — and the dummy
-    mm data is a plain list of PIL images under the ``image`` key.
+    Image dummy path is unchanged. When the profiler asks for video, emit
+    already-split 4-frame chunks under the ``video`` key.
     """
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        # Match post-renderer video prompts: each item is already a chunk
+        # string containing one <|media_pad|> for PromptReplacement to expand.
         num_images = mm_counts.get("image", 0)
-        return self.info.get_hf_config().image_placeholder * num_images
+        num_videos = mm_counts.get("video", 0)
+        hf_config = self.info.get_hf_config()
+        return (
+            hf_config.image_placeholder * num_images
+            + make_video_chunk_prompt("00:00:00.000") * num_videos
+        )
 
     def get_dummy_mm_data(
         self,
@@ -219,7 +368,7 @@ class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
             ImageDummyOptions | None,
             mm_options.get("image") if mm_options else None,
         )
-        return {
+        data: MultiModalDataDict = {
             "image": self._get_dummy_images(
                 width=max_size.width,
                 height=max_size.height,
@@ -228,28 +377,98 @@ class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
             )
         }
 
+        num_videos = mm_counts.get("video", 0)
+        if num_videos:
+            num_frames = int(media_proc_cfg.get("temporal_merge_kernel_size", 4))
+            per_frame_limit = int(
+                media_proc_cfg.get("in_patch_limit_each_frame")
+                or media_proc_cfg["in_patch_limit"]
+            )
+            chunk = {
+                "type": "video_chunk",
+                "video_chunk": self._get_dummy_images(
+                    width=max_size.width,
+                    height=max_size.height,
+                    num_images=num_frames,
+                ),
+                "prompt": make_video_chunk_prompt("00:00:00.000"),
+                "in_patch_limit": per_frame_limit,
+            }
+            data["video"] = [dict(chunk) for _ in range(num_videos)]
+        return data
+
 
 class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
-    """Image-only multi-modal processor for Kimi-K3."""
+    """Kimi-K3 processor: original image path + additive video chunk path."""
+
+    def split_video_chunks(self, video_data: Any) -> list[dict[str, Any]]:
+        """Split decoded video frames into timestamped MoonViT3d chunks.
+
+        ``in_patch_limit_video`` is treated as a global patch budget shared by
+        all sampled frames (HF discussion #172 / K2.5 contract).
+        """
+        frames, timestamps = frames_from_video_data(video_data)
+        media_proc_cfg = self.info.image_processor.media_proc_cfg
+        num_frames_per_chunk = int(media_proc_cfg.get("temporal_merge_kernel_size", 4))
+        per_frame_limit = int(
+            media_proc_cfg.get("in_patch_limit_each_frame")
+            or media_proc_cfg["in_patch_limit"]
+        )
+        total_patch_limit = media_proc_cfg.get("in_patch_limit_video")
+        if total_patch_limit is not None:
+            per_frame_limit = min(
+                per_frame_limit,
+                max(1, round(int(total_patch_limit) / len(frames))),
+            )
+
+        timestamp_mode = media_proc_cfg.get("timestamp_mode", "hh:mm:ss.fff")
+        chunks: list[dict[str, Any]] = []
+        for start in range(0, len(frames), num_frames_per_chunk):
+            chunk_frames = frames[start : start + num_frames_per_chunk]
+            timestamp = timestamp_as_str(timestamps[start], timestamp_mode)
+            chunks.append(
+                {
+                    "type": "video_chunk",
+                    "video_chunk": chunk_frames,
+                    "prompt": make_video_chunk_prompt(timestamp),
+                    "in_patch_limit": per_frame_limit,
+                }
+            )
+        return chunks
 
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        """Slice the flattened patch tensor back into per-image items.
+        """Slice image and video patch tensors into per-item fields.
 
-        ``pixel_values`` holds all patches from every image concatenated; each
-        image's patch count is ``prod(grid_thws[i])``. ``grid_thws`` is one
-        ``[N_t, N_h, N_w]`` row per image.
+        Image keeps ``pixel_values`` / ``grid_thws``. Video uses separate
+        ``video_pixel_values`` / ``video_grid_thws`` keys.
         """
-        grid_thws = hf_inputs.get("grid_thws", torch.empty((0, 3)))
-        grid_sizes = grid_thws.prod(-1)
+        fields: dict[str, MultiModalFieldConfig] = {}
 
-        return dict(
-            pixel_values=MultiModalFieldConfig.flat_from_sizes("image", grid_sizes),
-            grid_thws=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
-        )
+        grid_thws = hf_inputs.get("grid_thws")
+        if grid_thws is not None:
+            grid_sizes = grid_thws.prod(-1)
+            fields["pixel_values"] = MultiModalFieldConfig.flat_from_sizes(
+                "image", grid_sizes
+            )
+            fields["grid_thws"] = MultiModalFieldConfig.batched(
+                "image", keep_on_cpu=True
+            )
+
+        video_grid_thws = hf_inputs.get("video_grid_thws")
+        if video_grid_thws is not None:
+            video_grid_sizes = video_grid_thws.prod(-1)
+            fields["video_pixel_values"] = MultiModalFieldConfig.flat_from_sizes(
+                "video", video_grid_sizes
+            )
+            fields["video_grid_thws"] = MultiModalFieldConfig.batched(
+                "video", keep_on_cpu=True
+            )
+
+        return fields
 
     def _get_prompt_updates(
         self,
@@ -257,58 +476,63 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
         hf_processor_mm_kwargs: Mapping[str, Any],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        """Expand each K3 image placeholder into a resolution-aware update.
-
-        K3's prompt carries a single ``<|kimi_image_placeholder|>`` token per
-        image. This replaces that token with
-        ``<|media_begin|>image {w}x{h}<|media_content|>{pads}<|media_end|>``,
-        embedding the per-image resolution in the prompt and marking only the
-        ``<|media_pad|>`` positions as embedding slots (the number of pads is
-        the feature size returned by ``media_tokens_calculator``).
-        """
+        """Image WxH expansion (unchanged) + video media_pad expansion."""
         media_token_id = self.info.media_token_id
         media_token = self.info.media_token
         image_placeholder = self.info.get_hf_config().image_placeholder
         tokenizer = self.info.get_tokenizer()
+        updates: list[PromptUpdate] = []
 
-        def get_replacement(item_idx: int) -> PromptUpdateDetails:
-            images = mm_items.get_items("image", ImageProcessorItems)
-            image = images.get(item_idx)
-            if image is None:
-                raise ValueError(f"Missing image data at index {item_idx}")
+        if "image" in mm_items:
 
-            # The checkpoint image processor works on media dicts, so wrap the
-            # PIL image before asking it for the token count.
-            num_media_token = self.info.media_tokens_calculator(
-                {"type": "image", "image": image}
+            def get_image_replacement(item_idx: int) -> PromptUpdateDetails:
+                images = mm_items.get_items("image", ImageProcessorItems)
+                image = images.get(item_idx)
+                if image is None:
+                    raise ValueError(f"Missing image data at index {item_idx}")
+
+                num_media_token = self.info.media_tokens_calculator(
+                    {"type": "image", "image": image}
+                )
+                pads = media_token * num_media_token
+                width, height = images.get_image_size(item_idx)
+                full = (
+                    f"<|media_begin|>image {width}x{height}<|media_content|>"
+                    f"{pads}<|media_end|>"
+                )
+                return PromptUpdateDetails.select_token_id(
+                    cached_encode(tokenizer, full, add_special_tokens=False),
+                    media_token_id,
+                )
+
+            updates.append(
+                PromptReplacement(
+                    modality="image",
+                    target=cached_encode(
+                        tokenizer, image_placeholder, add_special_tokens=False
+                    ),
+                    replacement=get_image_replacement,
+                )
             )
-            pads = media_token * num_media_token
 
-            # NOTE: `width`/`height` are the ORIGINAL upload dimensions, not the
-            # post-preprocess (smart-resized) ones. `image` comes from the
-            # untouched parsed `mm_items`; the checkpoint image processor
-            # (`KimiK3VisionProcessor.preprocess`) only produces new tensors via
-            # `image.resize(...)` and never mutates the stored PIL. This matches
-            # the reference HF processor (`KimiK3Processor.preprocess_medias`),
-            # which also builds the prompt from the original `img.size`. The
-            # resize is reflected only in the pad count above.
-            width, height = images.get_image_size(item_idx)
-            full = (
-                f"<|media_begin|>image {width}x{height}<|media_content|>"
-                f"{pads}<|media_end|>"
+        if "video" in mm_items:
+            video_calc = (
+                getattr(self.info.video_processor, "media_tokens_calculator", None)
+                or self.info.media_tokens_calculator
             )
 
-            return PromptUpdateDetails.select_token_id(
-                cached_encode(tokenizer, full, add_special_tokens=False),
-                media_token_id,
+            def get_video_replacement(item_idx: int) -> list[int]:
+                videos = mm_items.get_items("video", KimiK3VideoChunkItems)
+                chunk = videos[item_idx]
+                num_media_token = video_calc(chunk)
+                return [media_token_id] * num_media_token
+
+            updates.append(
+                PromptReplacement(
+                    modality="video",
+                    target=[media_token_id],
+                    replacement=get_video_replacement,
+                )
             )
 
-        return [
-            PromptReplacement(
-                modality="image",
-                target=cached_encode(
-                    tokenizer, image_placeholder, add_special_tokens=False
-                ),
-                replacement=get_replacement,
-            ),
-        ]
+        return updates

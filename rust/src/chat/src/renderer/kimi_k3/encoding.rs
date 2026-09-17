@@ -22,6 +22,7 @@ pub(super) const CLOSE: &str = "<|close|>";
 pub(super) const SEP: &str = "<|sep|>";
 pub(super) const END_OF_MSG: &str = "<|end_of_msg|>";
 pub(super) const IMAGE_PLACEHOLDER: &str = "<|media_pad|>";
+pub(super) const VIDEO_PLACEHOLDER: &str = "<|kimi_k3_video_placeholder|>";
 
 const DEFAULT_THINKING_EFFORT: &str = "max";
 const VALID_THINKING_EFFORTS: &[&str] = &["low", "high", "max"];
@@ -503,7 +504,7 @@ fn write_content(
                         out.image(message_index, content_part_index)?;
                     }
                     ChatContentPart::VideoUrl { .. } => {
-                        return Err(Error::UnsupportedMultimodalContent("video_url"));
+                        out.control(VIDEO_PLACEHOLDER)?
                     }
                     ChatContentPart::InputAudio { .. } => {
                         return Err(Error::UnsupportedMultimodalContent("input_audio"));

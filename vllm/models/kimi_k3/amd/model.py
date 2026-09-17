@@ -78,6 +78,8 @@ class KimiK3ForConditionalGeneration(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
             return "<|kimi_image_placeholder|>"
+        if modality == "video":
+            return "<|kimi_k3_video_placeholder|>"
         raise ValueError(f"Unsupported modality: {modality}")
 
     def __init__(
@@ -99,7 +101,7 @@ class KimiK3ForConditionalGeneration(
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
-        with self._mark_tower_model(vllm_config, "image"):
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.vision_tower = MoonViT3dPretrainedModel(
                 config.vision_config,
                 quant_config=self._maybe_ignore_quant_config(quant_config),
@@ -147,6 +149,9 @@ class KimiK3ForConditionalGeneration(
     ) -> KimiK25MediaPixelInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         grid_thws = kwargs.pop("grid_thws", None)
+        if pixel_values is None:
+            pixel_values = kwargs.pop("video_pixel_values", None)
+            grid_thws = kwargs.pop("video_grid_thws", None)
         if pixel_values is None:
             return None
 
