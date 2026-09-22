@@ -650,4 +650,108 @@ mod tests {
             "missing histogram in:\n{rendered}"
         );
     }
+
+    /// Offloading `types`+`data` payload with empty-tuple map keys.
+    #[test]
+    fn schema_driven_offloading_label_tuple_payload_is_recorded() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::SchemaDrivenAdapter;
+        use crate::connector_metrics::schema::MetricsSchemaV1;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = SchemaDrivenAdapter::empty(metrics).with_default_id("OffloadingConnector");
+        let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "connector_id": "OffloadingConnector",
+            "metrics": [
+                {
+                    "name": "vllm:kv_offload_load_bytes",
+                    "type": "counter",
+                    "samples_path": "data.vllm:kv_offload_load_bytes",
+                    "sample_kind": "inc_by_u64"
+                },
+                {
+                    "name": "vllm:kv_offload_load_time",
+                    "type": "counter",
+                    "samples_path": "data.vllm:kv_offload_load_time",
+                    "sample_kind": "inc_by_f64"
+                },
+                {
+                    "name": "vllm:kv_offload_cpu_cache_usage_perc",
+                    "type": "gauge",
+                    "samples_path": "data.vllm:kv_offload_cpu_cache_usage_perc",
+                    "sample_kind": "set_f64"
+                },
+                {
+                    "name": "vllm:kv_offload_load_size",
+                    "type": "histogram",
+                    "buckets": [1e6, 5e6, 10e6],
+                    "samples_path": "data.vllm:kv_offload_load_size",
+                    "sample_kind": "observe_each_f64"
+                }
+            ]
+        }))
+        .unwrap();
+        generic.ensure_registered(schema).unwrap();
+
+        let empty_tuple = Value::Array(vec![]);
+        let mut data_map = vec![
+            (
+                Value::String("vllm:kv_offload_load_bytes".into()),
+                Value::Map(vec![(empty_tuple.clone(), Value::from(100u64))]),
+            ),
+            (
+                Value::String("vllm:kv_offload_load_time".into()),
+                Value::Map(vec![(empty_tuple.clone(), Value::F64(1.5))]),
+            ),
+            (
+                Value::String("vllm:kv_offload_cpu_cache_usage_perc".into()),
+                Value::Map(vec![(empty_tuple.clone(), Value::F64(0.25))]),
+            ),
+            (
+                Value::String("vllm:kv_offload_load_size".into()),
+                Value::Map(vec![(
+                    empty_tuple,
+                    Value::Array(vec![Value::F64(1e6), Value::F64(2e6)]),
+                )]),
+            ),
+        ];
+        let mut other = BTreeMap::new();
+        other.insert("types".to_string(), Value::Map(vec![]));
+        other.insert("data".to_string(), Value::Map(data_map.split_off(0)));
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(other)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_load_bytes_total{engine=\"0\",model_name=\"model\"} 100"
+            ),
+            "missing load_bytes in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"model\"} 1.5"
+            ),
+            "missing load_time in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_cpu_cache_usage_perc{engine=\"0\",model_name=\"model\"} 0.25"
+            ),
+            "missing gauge in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_load_size_count{engine=\"0\",model_name=\"model\"} 2"
+            ),
+            "missing histogram in:\n{rendered}"
+        );
+    }
 }

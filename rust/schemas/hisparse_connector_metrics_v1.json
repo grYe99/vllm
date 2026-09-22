@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "connector_id": "HiSparseConnector",
+  "metrics": [
+    {
+      "name": "vllm:hisparse_cache_hits",
+      "type": "counter",
+      "documentation": "HiSparse host-cache hits.",
+      "samples_path": "cache_hits",
+      "sample_kind": "inc_by_sum_u64"
+    },
+    {
+      "name": "vllm:hisparse_cache_misses",
+      "type": "counter",
+      "documentation": "HiSparse host-cache misses.",
+      "samples_path": "cache_misses",
+      "sample_kind": "inc_by_sum_u64"
+    },
+    {
+      "name": "vllm:hisparse_host_to_device_bytes",
+      "type": "counter",
+      "documentation": "Bytes transferred from HiSparse host pool to device.",
+      "samples_path": "host_to_device_bytes",
+      "sample_kind": "inc_by_sum_u64"
+    }
+  ]
+}

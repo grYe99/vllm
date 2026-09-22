@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use rmpv::Value;
 use tracing::warn;
 use vllm_metrics::{
-    connector_metric_labels, ConnectorMetricLabels, Family, F64Gauge, Histogram,
+    connector_metric_labels, ConnectorMetricLabels, Family, F64Counter, F64Gauge, Histogram,
     MetricConstructor, Metrics, U64Counter, U64Gauge,
 };
 
@@ -31,6 +31,7 @@ impl MetricConstructor<Histogram> for HistogramBuckets {
 
 enum DynamicFamily {
     Counter(Family<ConnectorMetricLabels, U64Counter>),
+    CounterF64(Family<ConnectorMetricLabels, F64Counter>),
     GaugeU64(Family<ConnectorMetricLabels, U64Gauge>),
     GaugeF64(Family<ConnectorMetricLabels, F64Gauge>),
     Histogram(Family<ConnectorMetricLabels, Histogram, HistogramBuckets>),
@@ -40,6 +41,7 @@ impl DynamicFamily {
     fn clone_family(&self) -> Result<Self, String> {
         Ok(match self {
             Self::Counter(f) => Self::Counter(f.clone()),
+            Self::CounterF64(f) => Self::CounterF64(f.clone()),
             Self::GaugeU64(f) => Self::GaugeU64(f.clone()),
             Self::GaugeF64(f) => Self::GaugeF64(f.clone()),
             Self::Histogram(f) => Self::Histogram(f.clone()),
@@ -210,13 +212,28 @@ impl SchemaDrivenAdapter {
         };
 
         Ok(match def.metric_type {
-            MetricType::Counter => {
-                let family: Family<ConnectorMetricLabels, U64Counter> = Family::default();
-                self.metrics.with_dynamic_registry(|registry| {
-                    registry.register(name, help, family.clone());
-                });
-                DynamicFamily::Counter(family)
-            }
+            MetricType::Counter => match def.sample_kind {
+                SampleKind::IncByF64 => {
+                    let family: Family<ConnectorMetricLabels, F64Counter> = Family::default();
+                    self.metrics.with_dynamic_registry(|registry| {
+                        registry.register(name, help, family.clone());
+                    });
+                    DynamicFamily::CounterF64(family)
+                }
+                SampleKind::IncByU64 | SampleKind::IncBySumU64 => {
+                    let family: Family<ConnectorMetricLabels, U64Counter> = Family::default();
+                    self.metrics.with_dynamic_registry(|registry| {
+                        registry.register(name, help, family.clone());
+                    });
+                    DynamicFamily::Counter(family)
+                }
+                other => {
+                    return Err(format!(
+                        "counter metric '{}' has unsupported sample_kind {other:?}",
+                        def.name
+                    ));
+                }
+            },
             MetricType::Gauge => match def.sample_kind {
                 SampleKind::SetU64 => {
                     let family: Family<ConnectorMetricLabels, U64Gauge> = Family::default();
@@ -329,6 +346,9 @@ fn observe_metric(bound: &BoundMetric, model_name: &str, engine: u32, payload: &
     let Some(sample) = value_at_path(payload, &bound.def.samples_path) else {
         return;
     };
+    // Offloading (and similar) nest values under label-tuple map keys;
+    // msgspec encodes `()` as an empty MessagePack array.
+    let sample = unwrap_label_tuple_map(sample);
     let scale = bound.def.scale;
 
     match (&bound.family, &bound.def.sample_kind) {
@@ -343,6 +363,13 @@ fn observe_metric(bound: &BoundMetric, model_name: &str, engine: u32, payload: &
             let sum = sum_u64(sample);
             if sum != 0 {
                 family.get_or_create(&labels).inc_by(sum);
+            }
+        }
+        (DynamicFamily::CounterF64(family), SampleKind::IncByF64) => {
+            if let Some(v) = as_f64(sample)
+                && v != 0.0
+            {
+                family.get_or_create(&labels).inc_by(v);
             }
         }
         (DynamicFamily::GaugeU64(family), SampleKind::SetU64) => {
@@ -367,6 +394,33 @@ fn observe_metric(bound: &BoundMetric, model_name: &str, engine: u32, payload: &
         }
         _ => {}
     }
+}
+
+/// Unwrap Offloading-style `{label_tuple: value}` maps to the unlabeled value.
+///
+/// Prefer the empty-tuple key (`Array([])`). If absent, use the sole entry or
+/// leave the map unchanged (callers then no-op on type mismatch).
+fn unwrap_label_tuple_map(sample: &Value) -> &Value {
+    let Value::Map(entries) = sample else {
+        return sample;
+    };
+    if entries.is_empty() {
+        return sample;
+    }
+    let all_array_keys = entries.iter().all(|(k, _)| matches!(k, Value::Array(_)));
+    if !all_array_keys {
+        return sample;
+    }
+    if let Some((_, v)) = entries
+        .iter()
+        .find(|(k, _)| matches!(k, Value::Array(a) if a.is_empty()))
+    {
+        return v;
+    }
+    if entries.len() == 1 {
+        return &entries[0].1;
+    }
+    sample
 }
 
 fn value_at_path<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {

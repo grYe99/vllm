@@ -17,6 +17,8 @@ pub(crate) const METRICS_SCHEMA_KEY: &str = "_metrics_schema";
 pub(crate) enum SampleKind {
     IncByU64,
     IncBySumU64,
+    /// Increment a float counter (e.g. Offloading transfer time seconds).
+    IncByF64,
     SetU64,
     SetF64,
     ObserveEachF64,
@@ -86,7 +88,10 @@ impl MetricsSchemaV1 {
                 ));
             }
             match (&metric.metric_type, &metric.sample_kind) {
-                (MetricType::Counter, SampleKind::IncByU64 | SampleKind::IncBySumU64) => {}
+                (
+                    MetricType::Counter,
+                    SampleKind::IncByU64 | SampleKind::IncBySumU64 | SampleKind::IncByF64,
+                ) => {}
                 (MetricType::Gauge, SampleKind::SetU64 | SampleKind::SetF64) => {}
                 (
                     MetricType::Histogram,
