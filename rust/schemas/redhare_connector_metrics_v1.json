@@ -1,0 +1,744 @@
+{
+  "schema_version": 1,
+  "connector_id": "RedhareConnector",
+  "metrics": [
+    {
+      "name": "redhare_put",
+      "type": "counter",
+      "documentation": "Redhare put attempts.",
+      "samples_path": "put_total",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_put_failed",
+      "type": "counter",
+      "documentation": "Redhare put failures.",
+      "samples_path": "put_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_put_fingerprint_mismatch",
+      "type": "counter",
+      "documentation": "Remote puts rejected by fingerprint mismatch.",
+      "samples_path": "put_fingerprint_mismatch",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_get",
+      "type": "counter",
+      "documentation": "Redhare get attempts.",
+      "samples_path": "get_total",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_get_hit_local",
+      "type": "counter",
+      "documentation": "Get served from local DRAM.",
+      "samples_path": "get_hit_local",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_get_hit_remote",
+      "type": "counter",
+      "documentation": "Get served from a peer via data plane.",
+      "samples_path": "get_hit_remote",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_get_hit_shared_fs",
+      "type": "counter",
+      "documentation": "Get served from SharedFs cold tier.",
+      "samples_path": "get_hit_shared_fs",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_get_miss",
+      "type": "counter",
+      "documentation": "Get missed all tiers.",
+      "samples_path": "get_miss",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_get_fingerprint_mismatch",
+      "type": "counter",
+      "documentation": "Reads rejected by fingerprint mismatch.",
+      "samples_path": "get_fingerprint_mismatch",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_bytes_put",
+      "type": "counter",
+      "documentation": "Bytes committed by put.",
+      "samples_path": "bytes_put",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_bytes_get",
+      "type": "counter",
+      "documentation": "Bytes returned by get.",
+      "samples_path": "bytes_get",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_local_evictions",
+      "type": "counter",
+      "documentation": "Local DRAM objects dropped.",
+      "samples_path": "local_evictions",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_local_tinylfu_protected",
+      "type": "counter",
+      "documentation": "Local DRAM TinyLFU protections.",
+      "samples_path": "local_tinylfu_protected",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_shared_fs_demote",
+      "type": "counter",
+      "documentation": "Successful DRAM\u2192SharedFs demotions.",
+      "samples_path": "shared_fs_demote_total",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_shared_fs_demote_failed",
+      "type": "counter",
+      "documentation": "Failed DRAM\u2192SharedFs demotions.",
+      "samples_path": "shared_fs_demote_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_reserve",
+      "type": "counter",
+      "documentation": "Successful remote-DRAM reservations.",
+      "samples_path": "remote_dram_reserve_total",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_reserve_no_space",
+      "type": "counter",
+      "documentation": "Remote-DRAM no-space rejects.",
+      "samples_path": "remote_dram_reserve_no_space",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_reserve_failed",
+      "type": "counter",
+      "documentation": "Remote-DRAM reservation errors.",
+      "samples_path": "remote_dram_reserve_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_bind",
+      "type": "counter",
+      "documentation": "Successful remote-DRAM binds.",
+      "samples_path": "remote_dram_bind_total",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_bind_failed",
+      "type": "counter",
+      "documentation": "Failed remote-DRAM binds.",
+      "samples_path": "remote_dram_bind_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_free",
+      "type": "counter",
+      "documentation": "Successful remote-DRAM frees.",
+      "samples_path": "remote_dram_free_total",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_free_failed",
+      "type": "counter",
+      "documentation": "Failed remote-DRAM frees.",
+      "samples_path": "remote_dram_free_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_reserve_reaped",
+      "type": "counter",
+      "documentation": "Reaped remote-DRAM reservations.",
+      "samples_path": "remote_dram_reserve_reaped",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_evictions",
+      "type": "counter",
+      "documentation": "Remote-DRAM slot evictions.",
+      "samples_path": "remote_dram_evictions",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_window_evictions",
+      "type": "counter",
+      "documentation": "Window slot evictions.",
+      "samples_path": "remote_dram_window_evictions",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_main_evictions",
+      "type": "counter",
+      "documentation": "Main slot evictions.",
+      "samples_path": "remote_dram_main_evictions",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_window_promotions",
+      "type": "counter",
+      "documentation": "Window\u2192Main promotions.",
+      "samples_path": "remote_dram_window_promotions",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_tinylfu_protected",
+      "type": "counter",
+      "documentation": "Remote TinyLFU protections.",
+      "samples_path": "remote_dram_tinylfu_protected",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_evicted_bytes",
+      "type": "counter",
+      "documentation": "Bytes evicted from remote-DRAM.",
+      "samples_path": "remote_dram_evicted_bytes",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_remote_dram_write_bytes",
+      "type": "counter",
+      "documentation": "Bytes written into remote-DRAM.",
+      "samples_path": "remote_dram_write_bytes",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_save_failed",
+      "type": "counter",
+      "documentation": "Connector-side save failures.",
+      "samples_path": "connector_save_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_load_failed",
+      "type": "counter",
+      "documentation": "Connector-side load failures.",
+      "samples_path": "connector_load_failed",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_chunks_dedup_skipped",
+      "type": "counter",
+      "documentation": "Chunks skipped by dedup.",
+      "samples_path": "connector_chunks_dedup_skipped",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_chunks_skipped_unbacked",
+      "type": "counter",
+      "documentation": "Chunks skipped unbacked.",
+      "samples_path": "connector_chunks_skipped_unbacked",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_chunks_skipped_retention",
+      "type": "counter",
+      "documentation": "Chunks skipped by retention.",
+      "samples_path": "connector_chunks_skipped_retention",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_save_skipped_behind",
+      "type": "counter",
+      "documentation": "Saves skipped behind.",
+      "samples_path": "connector_save_skipped_behind",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_save_cancelled",
+      "type": "counter",
+      "documentation": "Saves cancelled by preemption.",
+      "samples_path": "connector_save_cancelled",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_load_cancelled",
+      "type": "counter",
+      "documentation": "Loads cancelled by preemption.",
+      "samples_path": "connector_load_cancelled",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_save_unpublished",
+      "type": "counter",
+      "documentation": "Saves unpublished after preemption.",
+      "samples_path": "connector_save_unpublished",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_preempt_fence_timeout",
+      "type": "counter",
+      "documentation": "Preempt fence timeouts.",
+      "samples_path": "connector_preempt_fence_timeout",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_ssm_fp_checked",
+      "type": "counter",
+      "documentation": "SSM fingerprint checks.",
+      "samples_path": "connector_ssm_fp_checked",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_ssm_fp_mismatch",
+      "type": "counter",
+      "documentation": "SSM fingerprint mismatches.",
+      "samples_path": "connector_ssm_fp_mismatch",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_connector_ssm_fp_unsampled",
+      "type": "counter",
+      "documentation": "SSM fingerprint unsampled.",
+      "samples_path": "connector_ssm_fp_unsampled",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_external_cache_lookup",
+      "type": "counter",
+      "documentation": "External cache lookups.",
+      "samples_path": "external_cache_lookup",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_external_cache_eligible_tokens",
+      "type": "counter",
+      "documentation": "External cache eligible tokens.",
+      "samples_path": "external_cache_eligible_tokens",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_external_cache_hit_tokens",
+      "type": "counter",
+      "documentation": "External cache hit tokens.",
+      "samples_path": "external_cache_hit_tokens",
+      "sample_kind": "inc_by_u64"
+    },
+    {
+      "name": "redhare_put_path",
+      "type": "counter",
+      "documentation": "Successful put commits by storage path.",
+      "samples_path": "put_path_local",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "local"
+      }
+    },
+    {
+      "name": "redhare_put_path",
+      "type": "counter",
+      "documentation": "Successful put commits by storage path.",
+      "samples_path": "put_path_remote",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "remote"
+      }
+    },
+    {
+      "name": "redhare_put_path",
+      "type": "counter",
+      "documentation": "Successful put commits by storage path.",
+      "samples_path": "put_path_shared_fs",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "shared_fs"
+      }
+    },
+    {
+      "name": "redhare_put_bytes",
+      "type": "counter",
+      "documentation": "Bytes committed by put path.",
+      "samples_path": "put_bytes_local",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "local"
+      }
+    },
+    {
+      "name": "redhare_put_bytes",
+      "type": "counter",
+      "documentation": "Bytes committed by put path.",
+      "samples_path": "put_bytes_remote",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "remote"
+      }
+    },
+    {
+      "name": "redhare_put_bytes",
+      "type": "counter",
+      "documentation": "Bytes committed by put path.",
+      "samples_path": "put_bytes_shared_fs",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "shared_fs"
+      }
+    },
+    {
+      "name": "redhare_get_bytes",
+      "type": "counter",
+      "documentation": "Bytes returned by get path.",
+      "samples_path": "get_bytes_local",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "local"
+      }
+    },
+    {
+      "name": "redhare_get_bytes",
+      "type": "counter",
+      "documentation": "Bytes returned by get path.",
+      "samples_path": "get_bytes_remote",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "remote"
+      }
+    },
+    {
+      "name": "redhare_get_bytes",
+      "type": "counter",
+      "documentation": "Bytes returned by get path.",
+      "samples_path": "get_bytes_shared_fs",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "shared_fs"
+      }
+    },
+    {
+      "name": "redhare_local_admission_bypass",
+      "type": "counter",
+      "documentation": "Local admission bypass by path.",
+      "samples_path": "local_admission_bypass_remote",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "remote"
+      }
+    },
+    {
+      "name": "redhare_local_admission_bypass",
+      "type": "counter",
+      "documentation": "Local admission bypass by path.",
+      "samples_path": "local_admission_bypass_shared_fs",
+      "sample_kind": "inc_by_u64",
+      "const_labels": {
+        "path": "shared_fs"
+      }
+    },
+    {
+      "name": "redhare_local_objects_current",
+      "type": "gauge",
+      "documentation": "Current local DRAM objects.",
+      "samples_path": "local_objects_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_local_bytes_current",
+      "type": "gauge",
+      "documentation": "Current local DRAM bytes.",
+      "samples_path": "local_bytes_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_local_capacity_bytes",
+      "type": "gauge",
+      "documentation": "Local DRAM capacity bytes.",
+      "samples_path": "local_capacity_bytes",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_local_free_bytes",
+      "type": "gauge",
+      "documentation": "Local DRAM free bytes.",
+      "samples_path": "local_free_bytes",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_kvcache_capacity_bytes",
+      "type": "gauge",
+      "documentation": "KVCache capacity bytes.",
+      "samples_path": "kvcache_capacity_bytes",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_slots_current",
+      "type": "gauge",
+      "documentation": "Current remote-DRAM slots.",
+      "samples_path": "remote_dram_slots_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_bytes_current",
+      "type": "gauge",
+      "documentation": "Current remote-DRAM bytes.",
+      "samples_path": "remote_dram_bytes_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_window_percent_bps",
+      "type": "gauge",
+      "documentation": "Window percent bps.",
+      "samples_path": "remote_dram_window_percent_bps",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_window_slots_current",
+      "type": "gauge",
+      "documentation": "Window slots.",
+      "samples_path": "remote_dram_window_slots_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_window_bytes_current",
+      "type": "gauge",
+      "documentation": "Window bytes.",
+      "samples_path": "remote_dram_window_bytes_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_main_slots_current",
+      "type": "gauge",
+      "documentation": "Main slots.",
+      "samples_path": "remote_dram_main_slots_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_main_bytes_current",
+      "type": "gauge",
+      "documentation": "Main bytes.",
+      "samples_path": "remote_dram_main_bytes_current",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_capacity_bytes",
+      "type": "gauge",
+      "documentation": "Remote DRAM capacity.",
+      "samples_path": "remote_dram_capacity_bytes",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_remote_dram_free_bytes",
+      "type": "gauge",
+      "documentation": "Remote DRAM free bytes.",
+      "samples_path": "remote_dram_free_bytes",
+      "sample_kind": "set_u64"
+    },
+    {
+      "name": "redhare_put_latency_seconds",
+      "type": "histogram",
+      "documentation": "Redhare put latency.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "put_latency_us",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06
+    },
+    {
+      "name": "redhare_transport_read_latency_seconds",
+      "type": "histogram",
+      "documentation": "Data-plane read latency.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "transport_read_latency_us",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06
+    },
+    {
+      "name": "redhare_remove_latency_seconds",
+      "type": "histogram",
+      "documentation": "Redhare remove latency.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "remove_latency_us",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06
+    },
+    {
+      "name": "redhare_get_latency_seconds",
+      "type": "histogram",
+      "documentation": "Redhare get latency by outcome.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "get_latency_us_local",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06,
+      "const_labels": {
+        "outcome": "local"
+      }
+    },
+    {
+      "name": "redhare_get_latency_seconds",
+      "type": "histogram",
+      "documentation": "Redhare get latency by outcome.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "get_latency_us_remote",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06,
+      "const_labels": {
+        "outcome": "remote"
+      }
+    },
+    {
+      "name": "redhare_get_latency_seconds",
+      "type": "histogram",
+      "documentation": "Redhare get latency by outcome.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "get_latency_us_shared_fs",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06,
+      "const_labels": {
+        "outcome": "shared_fs"
+      }
+    },
+    {
+      "name": "redhare_get_latency_seconds",
+      "type": "histogram",
+      "documentation": "Redhare get latency by outcome.",
+      "buckets": [
+        5e-05,
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0
+      ],
+      "samples_path": "get_latency_us_miss",
+      "sample_kind": "observe_each_u64_as_f64",
+      "scale": 1e-06,
+      "const_labels": {
+        "outcome": "miss"
+      }
+    }
+  ]
+}

@@ -7,11 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
     EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric, LoraAdapterNames,
-    LoraInfoLabels, MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily,
+    LoraInfoLabels, Metrics, MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily,
     MooncakeOperationLabels, RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics,
-    U64Counter, U64Gauge, WaitingReasonLabels,
+    U64Counter, U64Gauge, WaitingReasonLabels, METRICS,
 };
 
+use crate::connector_metrics::{observe_opaque_connector_stats, SchemaDrivenAdapter};
 use crate::protocol::stats::{
     KvConnectorStats, MooncakeStats, MultiConnectorStats, NixlStats, SchedulerStats,
 };
@@ -41,6 +42,8 @@ impl IterationMetricHandles {
 /// frontend client.
 pub(crate) struct SchedulerStatsRecorder {
     engines: BTreeMap<u32, SchedulerStatsHandles>,
+    /// Schema-driven recorder for third-party KV connector stats.
+    generic_connector_metrics: SchemaDrivenAdapter,
 }
 
 /// Per-engine cached metric handles used while recording `SchedulerStats`.
@@ -106,6 +109,17 @@ impl SchedulerStatsRecorder {
         model_name: &str,
         engines: &[ConnectedEngine],
     ) -> Self {
+        Self::new_with_metrics(&*METRICS, metrics, model_name, engines)
+    }
+
+    /// Like [`Self::new`], but allows tests to inject a non-global metrics
+    /// registry for schema-driven connector families.
+    pub(crate) fn new_with_metrics(
+        root_metrics: &'static Metrics,
+        metrics: &SchedulerMetrics,
+        model_name: &str,
+        engines: &[ConnectedEngine],
+    ) -> Self {
         let engines = engines
             .iter()
             .filter_map(|engine| {
@@ -117,13 +131,16 @@ impl SchedulerStatsRecorder {
             })
             .collect();
 
-        Self { engines }
+        Self {
+            engines,
+            generic_connector_metrics: SchemaDrivenAdapter::from_env(root_metrics),
+        }
     }
 
     /// Record one scheduler-stats payload for the given engine index.
     pub(crate) fn record(&self, engine_index: u32, stats: &SchedulerStats) {
         if let Some(handles) = self.engines.get(&engine_index) {
-            record_scheduler_stats_with_handles(handles, stats);
+            record_scheduler_stats_with_handles(handles, stats, &self.generic_connector_metrics);
         }
     }
 }
@@ -207,7 +224,11 @@ fn resolve_scheduler_stats_handles(
 }
 
 /// Record scheduler-stats values through pre-resolved metric handles.
-fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &SchedulerStats) {
+fn record_scheduler_stats_with_handles(
+    handles: &SchedulerStatsHandles,
+    stats: &SchedulerStats,
+    generic: &SchemaDrivenAdapter,
+) {
     // Scheduler state gauges.
     handles.scheduler_running.set(stats.num_running_reqs);
     handles
@@ -291,23 +312,45 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
 
     // Connector-specific KV transfer stats. A bare connector reports its own
     // flat payload; MultiConnector reports connector class name -> flat child
-    // payload.
+    // payload. Unknown / third-party children go through the schema-driven
+    // generic adapter.
     if let Some(kv_connector_stats) = &stats.kv_connector_stats {
         match kv_connector_stats {
             KvConnectorStats::Nixl(stats) => record_nixl_stats(handles, stats),
             KvConnectorStats::Mooncake(stats) => record_mooncake_stats(handles, stats),
-            KvConnectorStats::Multi(stats) => record_multi_connector_stats(handles, stats),
-            KvConnectorStats::Other(_) => {}
+            KvConnectorStats::Multi(stats) => {
+                record_multi_connector_stats(handles, stats, generic)
+            }
+            KvConnectorStats::Other(map) => {
+                observe_opaque_connector_stats(
+                    generic,
+                    &handles.labels.model_name,
+                    handles.labels.engine,
+                    map,
+                );
+            }
         }
     }
 }
 
-fn record_multi_connector_stats(handles: &SchedulerStatsHandles, stats: &MultiConnectorStats) {
+fn record_multi_connector_stats(
+    handles: &SchedulerStatsHandles,
+    stats: &MultiConnectorStats,
+    generic: &SchemaDrivenAdapter,
+) {
     for nixl in [&stats.nixl, &stats.nixl_pull, &stats.nixl_push].into_iter().flatten() {
         record_nixl_stats(handles, nixl);
     }
     if let Some(mooncake) = &stats.mooncake {
         record_mooncake_stats(handles, mooncake);
+    }
+    if !stats.other.is_empty() {
+        observe_opaque_connector_stats(
+            generic,
+            &handles.labels.model_name,
+            handles.labels.engine,
+            &stats.other,
+        );
     }
 }
 
@@ -505,6 +548,9 @@ mod tests {
     fn kv_connector_stats_are_recorded_into_mooncake_and_nixl_metrics() {
         let metrics = Metrics::new();
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = crate::connector_metrics::SchemaDrivenAdapter::empty(Box::leak(Box::new(
+            Metrics::new(),
+        )));
 
         let stats = SchedulerStats {
             kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
@@ -515,7 +561,7 @@ mod tests {
             ..Default::default()
         };
 
-        super::record_scheduler_stats_with_handles(&handles, &stats);
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
 
         let rendered = metrics.render().unwrap();
         assert!(rendered.contains(
@@ -538,6 +584,70 @@ mod tests {
         assert!(
             rendered
                 .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 2")
+        );
+    }
+
+    /// Third-party flat connector stats are recorded via a schema, not a typed DTO.
+    #[test]
+    fn schema_driven_third_party_connector_stats_are_recorded() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::SchemaDrivenAdapter;
+        use crate::connector_metrics::schema::MetricsSchemaV1;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = SchemaDrivenAdapter::empty(metrics).with_default_id("FakeConnector");
+        let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "connector_id": "FakeConnector",
+            "metrics": [
+                {
+                    "name": "fake_puts",
+                    "type": "counter",
+                    "documentation": "Fake put attempts",
+                    "samples_path": "put_total",
+                    "sample_kind": "inc_by_u64"
+                },
+                {
+                    "name": "fake_latency_seconds",
+                    "type": "histogram",
+                    "documentation": "Fake latency",
+                    "buckets": [0.001, 0.01, 0.1, 1.0],
+                    "samples_path": "latency_us",
+                    "sample_kind": "observe_each_u64_as_f64",
+                    "scale": 1e-6
+                }
+            ]
+        }))
+        .unwrap();
+        generic.ensure_registered(schema).unwrap();
+
+        let mut other = BTreeMap::new();
+        other.insert("put_total".to_string(), Value::from(3u64));
+        other.insert(
+            "latency_us".to_string(),
+            Value::Array(vec![Value::from(1000u64), Value::from(2000u64)]),
+        );
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
+                other,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains("fake_puts_total{engine=\"0\",model_name=\"model\"} 3"),
+            "missing counter in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("fake_latency_seconds_count{engine=\"0\",model_name=\"model\"} 2"),
+            "missing histogram in:\n{rendered}"
         );
     }
 }
