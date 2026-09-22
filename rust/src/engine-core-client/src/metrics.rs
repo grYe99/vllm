@@ -754,4 +754,85 @@ mod tests {
             "missing histogram in:\n{rendered}"
         );
     }
+
+    /// Multi.other nests children by class name into the schema adapter.
+    #[test]
+    fn schema_driven_multi_nested_child_stats_are_recorded() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::SchemaDrivenAdapter;
+        use crate::connector_metrics::schema::MetricsSchemaV1;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = SchemaDrivenAdapter::empty(metrics);
+        for (id, path, kind) in [
+            ("OffloadingConnector", "data.vllm:kv_offload_store_bytes", "inc_by_u64"),
+            ("RedhareConnector", "put_total", "inc_by_u64"),
+        ] {
+            let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "connector_id": id,
+                "metrics": [{
+                    "name": if id.starts_with("Offload") {
+                        "vllm:kv_offload_store_bytes"
+                    } else {
+                        "redhare_put"
+                    },
+                    "type": "counter",
+                    "samples_path": path,
+                    "sample_kind": kind
+                }]
+            }))
+            .unwrap();
+            generic.ensure_registered(schema).unwrap();
+        }
+
+        let empty_tuple = Value::Array(vec![]);
+        let offload_payload = Value::Map(vec![
+            (Value::String("types".into()), Value::Map(vec![])),
+            (
+                Value::String("data".into()),
+                Value::Map(vec![(
+                    Value::String("vllm:kv_offload_store_bytes".into()),
+                    Value::Map(vec![(empty_tuple, Value::from(42u64))]),
+                )]),
+            ),
+        ]);
+        let mut redhare_map = BTreeMap::new();
+        redhare_map.insert("put_total".to_string(), Value::from(7u64));
+
+        let mut other = BTreeMap::new();
+        other.insert("OffloadingConnector".to_string(), offload_payload);
+        other.insert(
+            "RedhareConnector".to_string(),
+            Value::Map(
+                redhare_map
+                    .into_iter()
+                    .map(|(k, v)| (Value::String(k.into()), v))
+                    .collect(),
+            ),
+        );
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
+                other,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"model\"} 42"
+            ),
+            "missing nested offload in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("redhare_put_total{engine=\"0\",model_name=\"model\"} 7"),
+            "missing nested redhare in:\n{rendered}"
+        );
+    }
 }
