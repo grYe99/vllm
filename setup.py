@@ -1446,6 +1446,10 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        # MetricsSchemaV1 JSON for Rust frontend (emitted via _metrics_schema)
+        "distributed/kv_transfer/kv_connector/v1/offloading/*.json",
+        "distributed/kv_transfer/kv_connector/v1/hf3fs/*.json",
+        "distributed/kv_transfer/kv_connector/v1/hisparse/*.json",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",

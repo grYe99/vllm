@@ -10,6 +10,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema import (
+    load_metrics_schema,
+    maybe_attach_metrics_schema,
+    strip_metrics_schema,
+)
 from vllm.v1.kv_offload.base import (
     OffloadingCounterMetadata,
     OffloadingGaugeMetadata,
@@ -190,8 +195,19 @@ class OffloadingConnectorStats(KVConnectorStats):
     """
 
     def __post_init__(self):
+        # Wire may include _metrics_schema; keep it out of the accumulator.
+        self.data = strip_metrics_schema(self.data) or {}
         if _StatsKey.DATA not in self.data:
             self.reset()
+
+    def to_dict(self) -> dict[str, Any]:
+        return maybe_attach_metrics_schema(
+            self.data,
+            connector_id="OffloadingConnector",
+            schema=load_metrics_schema(
+                "vllm.distributed.kv_transfer.kv_connector.v1.offloading"
+            ),
+        )
 
     def reset(self):
         self.data: dict[str, Any] = {

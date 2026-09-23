@@ -5,11 +5,8 @@
 //!
 //! First-party Nixl / Mooncake keep typed DTOs and observe paths. Other
 //! payloads (`Multi.other` / `Other`) are recorded here when a metrics schema
-//! is available:
-//! - **builtins** (Offloading / HF3FS / HiSparse) auto-registered at init;
-//! - env `VLLM_KV_CONNECTOR_METRICS_SCHEMA` (escape hatch / override);
-//! - optional `_metrics_schema` in the payload;
-//! - later: handshake channel.
+//! is available via the reserved stats key ``_metrics_schema`` (connectors
+//! emit it once under ``VLLM_USE_RUST_FRONTEND``). Later: handshake channel.
 
 mod adapter;
 mod dispatch;

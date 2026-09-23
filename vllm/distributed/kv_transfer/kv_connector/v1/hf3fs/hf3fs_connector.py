@@ -58,6 +58,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema import (
+    load_metrics_schema,
+    maybe_attach_metrics_schema,
+    strip_metrics_schema,
+)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
@@ -1018,9 +1023,20 @@ class HF3FSKVConnectorStats(KVConnectorStats):
     """Container for transfer performance metrics."""
 
     def __post_init__(self):
+        # Wire may include _metrics_schema; keep it out of the accumulator.
+        self.data = strip_metrics_schema(self.data) or {}
         if not self.data:
             # Empty container init, no data is passed in.
             self.reset()
+
+    def to_dict(self) -> dict[str, Any]:
+        return maybe_attach_metrics_schema(
+            self.data,
+            connector_id="HF3FSKVConnector",
+            schema=load_metrics_schema(
+                "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs"
+            ),
+        )
 
     def reset(self):
         # Must be serializable

@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use rmpv::Value;
 
-use super::adapter::SchemaDrivenAdapter;
+use super::adapter::{SchemaDrivenAdapter, connector_id_from_payload_schema};
+use super::schema::METRICS_SCHEMA_KEY;
 
 /// Builtin connector class names claimed by typed adapters (not generic).
 const BUILTIN_CONNECTOR_IDS: &[&str] = &[
@@ -41,8 +42,8 @@ pub(crate) fn observe_opaque_connector_stats(
         return;
     }
 
-    // Flat single-connector payload (e.g. Redhare `to_dict()` = stats data,
-    // or Offloading `{types,data}`).
+    // Flat single-connector payload. Prefer ``_metrics_schema.connector_id``,
+    // else the sole already-registered schema (data-only ticks after one-shot).
     let payload = Value::Map(
         map.iter().map(|(k, v)| (Value::String(k.as_str().into()), v.clone())).collect(),
     );
@@ -56,41 +57,14 @@ fn resolve_flat_connector_id(
     generic: &SchemaDrivenAdapter,
     map: &BTreeMap<String, Value>,
 ) -> Option<String> {
-    // 1) Exactly one schema loaded from env → bind flat maps to that id.
-    if let Some(id) = generic.sole_env_connector_id() {
-        return Some(id.to_string());
+    // 1) Payload carries schema → use its connector_id.
+    if map.contains_key(METRICS_SCHEMA_KEY) {
+        return connector_id_from_payload_schema(map);
     }
+    // 2) Data-only after one-shot: exactly one schema already registered.
     let ids = generic.registered_ids();
-    // 2) Only one schema registered overall (e.g. tests without builtins).
     if ids.len() == 1 {
         return ids.into_iter().next();
-    }
-    // 3) Distinctive in-tree payload shapes against registered schemas.
-    if let Some(id) = infer_connector_id_from_payload(map) {
-        if ids.iter().any(|registered| registered == &id) {
-            return Some(id);
-        }
-    }
-    // 4) Ambiguous → caller warns via observe("<unknown>").
-    None
-}
-
-fn infer_connector_id_from_payload(map: &BTreeMap<String, Value>) -> Option<String> {
-    if map.contains_key("types") && map.contains_key("data") {
-        return Some("OffloadingConnector".to_string());
-    }
-    if map.contains_key("save_duration")
-        || map.contains_key("load_duration")
-        || map.contains_key("num_failed_save")
-        || map.contains_key("num_failed_load")
-    {
-        return Some("HF3FSKVConnector".to_string());
-    }
-    if map.contains_key("cache_hits")
-        || map.contains_key("cache_misses")
-        || map.contains_key("host_to_device_bytes")
-    {
-        return Some("HiSparseConnector".to_string());
     }
     None
 }
@@ -99,7 +73,7 @@ fn is_builtin_connector_id(id: &str) -> bool {
     BUILTIN_CONNECTOR_IDS.iter().any(|b| *b == id)
 }
 
-/// Heuristic: Multi child keys are Python `__class__.__name__` strings.
+/// Heuristic: Multi child keys are Python ``__class__.__name__`` strings.
 fn looks_like_connector_class_name(key: &str) -> bool {
     let Some(first) = key.chars().next() else {
         return false;

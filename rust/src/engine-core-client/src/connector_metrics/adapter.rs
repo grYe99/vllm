@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use parking_lot::RwLock;
@@ -16,8 +15,6 @@ use vllm_metrics::{
 use super::schema::{
     METRICS_SCHEMA_KEY, MetricDef, MetricType, MetricsSchemaV1, SCHEMA_VERSION_V1, SampleKind,
 };
-
-const ENV_SCHEMA_PATHS: &str = "VLLM_KV_CONNECTOR_METRICS_SCHEMA";
 
 #[derive(Clone)]
 struct HistogramBuckets(Arc<Vec<f64>>);
@@ -58,132 +55,32 @@ struct SchemaInstance {
 }
 
 /// Registers and observes schema-driven connector metrics.
+///
+/// Schemas arrive via the reserved stats key ``_metrics_schema`` (Python
+/// connectors emit it once when the Rust frontend is enabled). There is no
+/// env-path or ``include_str!`` builtin loader.
 pub(crate) struct SchemaDrivenAdapter {
     metrics: &'static Metrics,
     instances: RwLock<BTreeMap<String, SchemaInstance>>,
-    /// When exactly one schema was loaded from `VLLM_KV_CONNECTOR_METRICS_SCHEMA`,
-    /// flat opaque maps bind to this `connector_id` (no second env var).
-    sole_env_connector_id: Option<String>,
     warned_missing: Mutex<BTreeSet<String>>,
     warned_bad_schema: Mutex<BTreeSet<String>>,
 }
 
 impl SchemaDrivenAdapter {
-    /// Register in-tree builtin schemas, then env paths (env overrides by id).
-    pub(crate) fn from_env(metrics: &'static Metrics) -> Self {
-        let mut builtin: BTreeMap<String, MetricsSchemaV1> = BTreeMap::new();
-        for schema in builtin_schemas() {
-            builtin.insert(schema.connector_id.clone(), schema);
-        }
-
-        let mut from_env: BTreeMap<String, MetricsSchemaV1> = BTreeMap::new();
-        if let Ok(paths) = std::env::var(ENV_SCHEMA_PATHS) {
-            for path in paths.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                match load_schema_file(path) {
-                    Ok(schema) => {
-                        from_env.insert(schema.connector_id.clone(), schema);
-                    }
-                    Err(err) => {
-                        warn!(
-                            path,
-                            error = %err,
-                            "failed to load KV connector metrics schema"
-                        );
-                    }
-                }
-            }
-        }
-
-        let sole_env_connector_id = if from_env.len() == 1 {
-            from_env.keys().next().cloned()
-        } else {
-            None
-        };
-
-        let mut schemas = builtin;
-        for (id, schema) in from_env {
-            schemas.insert(id, schema);
-        }
-
-        let adapter = Self {
-            metrics,
-            instances: RwLock::new(BTreeMap::new()),
-            sole_env_connector_id,
-            warned_missing: Mutex::new(BTreeSet::new()),
-            warned_bad_schema: Mutex::new(BTreeSet::new()),
-        };
-        for schema in schemas.into_values() {
-            if let Err(err) = adapter.ensure_registered(schema) {
-                warn!(
-                    error = %err,
-                    "failed to register KV connector metrics schema"
-                );
-            }
-        }
-        adapter
-    }
-
-    /// Construct an empty adapter (tests) — no builtins, no env.
-    #[cfg(test)]
-    pub(crate) fn empty(metrics: &'static Metrics) -> Self {
+    /// Empty adapter; schemas register lazily from payload ``_metrics_schema``.
+    pub(crate) fn new(metrics: &'static Metrics) -> Self {
         Self {
             metrics,
             instances: RwLock::new(BTreeMap::new()),
-            sole_env_connector_id: None,
             warned_missing: Mutex::new(BTreeSet::new()),
             warned_bad_schema: Mutex::new(BTreeSet::new()),
         }
     }
 
-    /// Register only in-tree builtins (tests / zero-env Offloading path).
+    /// Construct an empty adapter (tests).
     #[cfg(test)]
-    pub(crate) fn with_builtins(metrics: &'static Metrics) -> Self {
-        let adapter = Self::empty(metrics);
-        for schema in builtin_schemas() {
-            adapter.ensure_registered(schema).expect("builtin schema must validate");
-        }
-        adapter
-    }
-
-    /// Register one schema as if it were the sole env-loaded schema (tests).
-    #[cfg(test)]
-    pub(crate) fn with_sole_env_schema(metrics: &'static Metrics, schema: MetricsSchemaV1) -> Self {
-        let id = schema.connector_id.clone();
-        let adapter = Self {
-            metrics,
-            instances: RwLock::new(BTreeMap::new()),
-            sole_env_connector_id: Some(id),
-            warned_missing: Mutex::new(BTreeSet::new()),
-            warned_bad_schema: Mutex::new(BTreeSet::new()),
-        };
-        adapter.ensure_registered(schema).expect("test schema must validate");
-        adapter
-    }
-
-    /// Builtins plus one env schema (production-like flat external binding).
-    #[cfg(test)]
-    pub(crate) fn with_builtins_and_sole_env_schema(
-        metrics: &'static Metrics,
-        schema: MetricsSchemaV1,
-    ) -> Self {
-        let id = schema.connector_id.clone();
-        let adapter = Self {
-            metrics,
-            instances: RwLock::new(BTreeMap::new()),
-            sole_env_connector_id: Some(id),
-            warned_missing: Mutex::new(BTreeSet::new()),
-            warned_bad_schema: Mutex::new(BTreeSet::new()),
-        };
-        for builtin in builtin_schemas() {
-            adapter.ensure_registered(builtin).expect("builtin schema must validate");
-        }
-        adapter.ensure_registered(schema).expect("test schema must validate");
-        adapter
-    }
-
-    /// Sole env-loaded connector id, when exactly one schema came from env.
-    pub(crate) fn sole_env_connector_id(&self) -> Option<&str> {
-        self.sole_env_connector_id.as_deref()
+    pub(crate) fn empty(metrics: &'static Metrics) -> Self {
+        Self::new(metrics)
     }
 
     pub(crate) fn registered_ids(&self) -> Vec<String> {
@@ -205,7 +102,11 @@ impl SchemaDrivenAdapter {
         Ok(())
     }
 
-    /// Observe one opaque connector stats object for `connector_id`.
+    /// Observe one opaque connector stats object for ``connector_id``.
+    ///
+    /// When the payload carries ``_metrics_schema``, that document's
+    /// ``connector_id`` is used for registration and for this observe binding
+    /// (overrides the caller-supplied id for flat payloads).
     pub(crate) fn observe(
         &self,
         connector_id: &str,
@@ -214,11 +115,13 @@ impl SchemaDrivenAdapter {
         payload: &Value,
     ) {
         let mut payload = payload.clone();
+        let mut bound_id = connector_id.to_string();
         if let Some(schema_value) = map_remove(&mut payload, METRICS_SCHEMA_KEY) {
             match rmpv_to_schema(&schema_value) {
                 Ok(schema) => {
+                    bound_id = schema.connector_id.clone();
                     if let Err(err) = self.ensure_registered(schema) {
-                        self.warn_bad_schema(connector_id, &err);
+                        self.warn_bad_schema(&bound_id, &err);
                     }
                 }
                 Err(err) => self.warn_bad_schema(connector_id, &err),
@@ -227,9 +130,9 @@ impl SchemaDrivenAdapter {
         let _ = map_remove(&mut payload, "_n_steps");
 
         let instances = self.instances.read();
-        let Some(instance) = instances.get(connector_id) else {
+        let Some(instance) = instances.get(&bound_id) else {
             drop(instances);
-            self.warn_missing(connector_id);
+            self.warn_missing(&bound_id);
             return;
         };
 
@@ -333,7 +236,7 @@ impl SchemaDrivenAdapter {
             warn!(
                 connector_id,
                 "KV connector stats collected but no metrics schema is registered; \
-                 set {ENV_SCHEMA_PATHS} or publish schema via handshake"
+                 connectors must emit _metrics_schema once in their stats payload"
             );
         }
     }
@@ -358,54 +261,26 @@ fn strip_counter_total_suffix<'a>(name: &'a str, metric_type: &MetricType) -> &'
     }
 }
 
-fn load_schema_file(path: &str) -> Result<MetricsSchemaV1, String> {
-    let raw =
-        std::fs::read_to_string(Path::new(path)).map_err(|err| format!("read {path}: {err}"))?;
-    parse_schema_json(&raw, path)
-}
-
-fn parse_schema_json(raw: &str, source: &str) -> Result<MetricsSchemaV1, String> {
-    let schema: MetricsSchemaV1 =
-        serde_json::from_str(raw).map_err(|err| format!("parse {source}: {err}"))?;
+fn rmpv_to_schema(value: &Value) -> Result<MetricsSchemaV1, String> {
+    // Round-trip via JSON so schema parsing stays serde_json-based.
+    let json = serde_json::to_value(value).map_err(|err| err.to_string())?;
+    let schema: MetricsSchemaV1 = serde_json::from_value(json).map_err(|err| err.to_string())?;
     if schema.schema_version != SCHEMA_VERSION_V1 {
         return Err(format!(
-            "unsupported schema_version {} in {source}",
+            "unsupported schema_version {}",
             schema.schema_version
         ));
     }
     Ok(schema)
 }
 
-/// In-tree connector schemas auto-registered without env.
-fn builtin_schemas() -> Vec<MetricsSchemaV1> {
-    const BUILTINS: &[(&str, &str)] = &[
-        (
-            "offloading_connector_metrics_v1.json",
-            include_str!("builtins/offloading_connector_metrics_v1.json"),
-        ),
-        (
-            "hf3fs_connector_metrics_v1.json",
-            include_str!("builtins/hf3fs_connector_metrics_v1.json"),
-        ),
-        (
-            "hisparse_connector_metrics_v1.json",
-            include_str!("builtins/hisparse_connector_metrics_v1.json"),
-        ),
-    ];
-    let mut out = Vec::with_capacity(BUILTINS.len());
-    for (name, raw) in BUILTINS {
-        match parse_schema_json(raw, name) {
-            Ok(schema) => out.push(schema),
-            Err(err) => warn!(schema = *name, error = %err, "invalid builtin KV connector schema"),
-        }
+/// Parse ``_metrics_schema`` from a flat stats map, if present.
+pub(crate) fn connector_id_from_payload_schema(map: &BTreeMap<String, Value>) -> Option<String> {
+    let value = map.get(METRICS_SCHEMA_KEY)?;
+    match rmpv_to_schema(value) {
+        Ok(schema) => Some(schema.connector_id),
+        Err(_) => None,
     }
-    out
-}
-
-fn rmpv_to_schema(value: &Value) -> Result<MetricsSchemaV1, String> {
-    // Round-trip via JSON so schema parsing stays serde_json-based.
-    let json = serde_json::to_value(value).map_err(|err| err.to_string())?;
-    serde_json::from_value(json).map_err(|err| err.to_string())
 }
 
 fn map_remove(payload: &mut Value, key: &str) -> Option<Value> {

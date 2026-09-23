@@ -133,7 +133,7 @@ impl SchedulerStatsRecorder {
 
         Self {
             engines,
-            generic_connector_metrics: SchemaDrivenAdapter::from_env(root_metrics),
+            generic_connector_metrics: SchemaDrivenAdapter::new(root_metrics),
         }
     }
 
@@ -585,17 +585,19 @@ mod tests {
         );
     }
 
-    /// Third-party flat connector stats are recorded via a schema, not a typed DTO.
+    /// Third-party flat stats: first tick carries ``_metrics_schema``, later data-only.
     #[test]
-    fn schema_driven_third_party_connector_stats_are_recorded() {
+    fn payload_metrics_schema_registers_once_then_data_only() {
         use rmpv::Value;
 
         use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::MetricsSchemaV1;
+        use crate::connector_metrics::schema::METRICS_SCHEMA_KEY;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
+        let generic = SchemaDrivenAdapter::empty(metrics);
+
+        let schema_json = serde_json::json!({
             "schema_version": 1,
             "connector_id": "FakeConnector",
             "metrics": [
@@ -616,49 +618,62 @@ mod tests {
                     "scale": 1e-6
                 }
             ]
-        }))
-        .unwrap();
-        let generic = SchemaDrivenAdapter::with_sole_env_schema(metrics, schema);
+        });
+        let schema_value: Value =
+            rmpv::ext::to_value(&schema_json).expect("schema to msgpack value");
 
-        let mut other = BTreeMap::new();
-        other.insert("put_total".to_string(), Value::from(3u64));
-        other.insert(
+        let mut first = BTreeMap::new();
+        first.insert(METRICS_SCHEMA_KEY.to_string(), schema_value);
+        first.insert("put_total".to_string(), Value::from(3u64));
+        first.insert(
             "latency_us".to_string(),
             Value::Array(vec![Value::from(1000u64), Value::from(2000u64)]),
         );
-
         let stats = SchedulerStats {
-            kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
-                other,
-                ..Default::default()
-            }))),
+            kv_connector_stats: Some(KvConnectorStats::Other(first)),
             ..Default::default()
         };
-
         super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
 
         let rendered = metrics.render().unwrap();
         assert!(
             rendered.contains("fake_puts_total{engine=\"0\",model_name=\"model\"} 3"),
-            "missing counter in:\n{rendered}"
+            "missing counter after schema tick:\n{rendered}"
         );
         assert!(
             rendered.contains("fake_latency_seconds_count{engine=\"0\",model_name=\"model\"} 2"),
-            "missing histogram in:\n{rendered}"
+            "missing histogram after schema tick:\n{rendered}"
+        );
+        assert_eq!(generic.registered_ids(), vec!["FakeConnector".to_string()]);
+
+        // Second tick: data only — binds via sole registered schema.
+        let mut second = BTreeMap::new();
+        second.insert("put_total".to_string(), Value::from(4u64));
+        let stats2 = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(second)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats2, &generic);
+        let rendered2 = metrics.render().unwrap();
+        assert!(
+            rendered2.contains("fake_puts_total{engine=\"0\",model_name=\"model\"} 7"),
+            "data-only tick should continue observing:\n{rendered2}"
         );
     }
 
-    /// Offloading `types`+`data` payload with empty-tuple map keys.
+    /// Offloading `types`+`data` payload with empty-tuple map keys via payload schema.
     #[test]
     fn schema_driven_offloading_label_tuple_payload_is_recorded() {
         use rmpv::Value;
 
         use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::MetricsSchemaV1;
+        use crate::connector_metrics::schema::METRICS_SCHEMA_KEY;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
+        let generic = SchemaDrivenAdapter::empty(metrics);
+
+        let schema_json = serde_json::json!({
             "schema_version": 1,
             "connector_id": "OffloadingConnector",
             "metrics": [
@@ -688,14 +703,12 @@ mod tests {
                     "sample_kind": "observe_each_f64"
                 }
             ]
-        }))
-        .unwrap();
-        // Single registered schema (no DEFAULT_ID): flat Other binds by id count.
-        let generic = SchemaDrivenAdapter::empty(metrics);
-        generic.ensure_registered(schema).unwrap();
+        });
+        let schema_value: Value =
+            rmpv::ext::to_value(&schema_json).expect("schema to msgpack value");
 
         let empty_tuple = Value::Array(vec![]);
-        let mut data_map = vec![
+        let data_map = vec![
             (
                 Value::String("vllm:kv_offload_load_bytes".into()),
                 Value::Map(vec![(empty_tuple.clone(), Value::from(100u64))]),
@@ -717,8 +730,9 @@ mod tests {
             ),
         ];
         let mut other = BTreeMap::new();
+        other.insert(METRICS_SCHEMA_KEY.to_string(), schema_value);
         other.insert("types".to_string(), Value::Map(vec![]));
-        other.insert("data".to_string(), Value::Map(data_map.split_off(0)));
+        other.insert("data".to_string(), Value::Map(data_map));
 
         let stats = SchedulerStats {
             kv_connector_stats: Some(KvConnectorStats::Other(other)),
@@ -751,45 +765,45 @@ mod tests {
         );
     }
 
-    /// Multi.other nests children by class name into the schema adapter.
+    /// Multi.other: class-name key + child ``_metrics_schema``.
     #[test]
-    fn schema_driven_multi_nested_child_stats_are_recorded() {
+    fn schema_driven_multi_nested_child_with_payload_schema() {
         use rmpv::Value;
 
         use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::MetricsSchemaV1;
+        use crate::connector_metrics::schema::METRICS_SCHEMA_KEY;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
         let generic = SchemaDrivenAdapter::empty(metrics);
-        for (id, path, kind) in [
-            (
-                "OffloadingConnector",
-                "data.vllm:kv_offload_store_bytes",
-                "inc_by_u64",
-            ),
-            ("RedhareConnector", "put_total", "inc_by_u64"),
-        ] {
-            let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
-                "schema_version": 1,
-                "connector_id": id,
-                "metrics": [{
-                    "name": if id.starts_with("Offload") {
-                        "vllm:kv_offload_store_bytes"
-                    } else {
-                        "redhare_put"
-                    },
-                    "type": "counter",
-                    "samples_path": path,
-                    "sample_kind": kind
-                }]
-            }))
-            .unwrap();
-            generic.ensure_registered(schema).unwrap();
-        }
+
+        let offload_schema = serde_json::json!({
+            "schema_version": 1,
+            "connector_id": "OffloadingConnector",
+            "metrics": [{
+                "name": "vllm:kv_offload_store_bytes",
+                "type": "counter",
+                "samples_path": "data.vllm:kv_offload_store_bytes",
+                "sample_kind": "inc_by_u64"
+            }]
+        });
+        let redhare_schema = serde_json::json!({
+            "schema_version": 1,
+            "connector_id": "RedhareConnector",
+            "metrics": [{
+                "name": "redhare_put",
+                "type": "counter",
+                "samples_path": "put_total",
+                "sample_kind": "inc_by_u64"
+            }]
+        });
 
         let empty_tuple = Value::Array(vec![]);
         let offload_payload = Value::Map(vec![
+            (
+                Value::String(METRICS_SCHEMA_KEY.into()),
+                rmpv::ext::to_value(&offload_schema).unwrap(),
+            ),
             (Value::String("types".into()), Value::Map(vec![])),
             (
                 Value::String("data".into()),
@@ -799,17 +813,17 @@ mod tests {
                 )]),
             ),
         ]);
-        let mut redhare_map = BTreeMap::new();
-        redhare_map.insert("put_total".to_string(), Value::from(7u64));
+        let redhare_payload = Value::Map(vec![
+            (
+                Value::String(METRICS_SCHEMA_KEY.into()),
+                rmpv::ext::to_value(&redhare_schema).unwrap(),
+            ),
+            (Value::String("put_total".into()), Value::from(7u64)),
+        ]);
 
         let mut other = BTreeMap::new();
         other.insert("OffloadingConnector".to_string(), offload_payload);
-        other.insert(
-            "RedhareConnector".to_string(),
-            Value::Map(
-                redhare_map.into_iter().map(|(k, v)| (Value::String(k.into()), v)).collect(),
-            ),
-        );
+        other.insert("RedhareConnector".to_string(), redhare_payload);
 
         let stats = SchedulerStats {
             kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
@@ -833,59 +847,16 @@ mod tests {
         );
     }
 
-    /// In-tree Offloading works from builtins with no SCHEMA env.
+    /// Flat external stats without ``_metrics_schema`` are dropped.
     #[test]
-    fn builtin_offloading_schema_observes_without_env() {
+    fn flat_connector_without_payload_schema_is_not_recorded() {
         use rmpv::Value;
 
         use crate::connector_metrics::SchemaDrivenAdapter;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::with_builtins(metrics);
-        assert!(
-            generic.registered_ids().iter().any(|id| id == "OffloadingConnector"),
-            "Offloading must be auto-registered: {:?}",
-            generic.registered_ids()
-        );
-
-        let empty_tuple = Value::Array(vec![]);
-        let mut other = BTreeMap::new();
-        other.insert("types".to_string(), Value::Map(vec![]));
-        other.insert(
-            "data".to_string(),
-            Value::Map(vec![(
-                Value::String("vllm:kv_offload_store_bytes".into()),
-                Value::Map(vec![(empty_tuple, Value::from(99u64))]),
-            )]),
-        );
-
-        let stats = SchedulerStats {
-            kv_connector_stats: Some(KvConnectorStats::Other(other)),
-            ..Default::default()
-        };
-        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
-
-        let rendered = metrics.render().unwrap();
-        assert!(
-            rendered.contains(
-                "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"model\"} 99"
-            ),
-            "builtin Offloading should observe without env:\n{rendered}"
-        );
-    }
-
-    /// Out-of-tree flat stats still need an explicit schema (env / payload).
-    #[test]
-    fn external_flat_connector_without_schema_is_not_recorded() {
-        use rmpv::Value;
-
-        use crate::connector_metrics::SchemaDrivenAdapter;
-
-        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
-        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        // Builtins only — no Redhare schema / sole-env binding.
-        let generic = SchemaDrivenAdapter::with_builtins(metrics);
+        let generic = SchemaDrivenAdapter::empty(metrics);
 
         let mut other = BTreeMap::new();
         other.insert("put_total".to_string(), Value::from(5u64));
@@ -899,50 +870,9 @@ mod tests {
 
         let rendered = metrics.render().unwrap();
         assert!(
-            !rendered.contains("redhare_put"),
-            "external metrics must not appear without schema:\n{rendered}"
-        );
-        assert!(
             !rendered.contains("put_total{"),
             "unregistered flat fields must not become Prom series:\n{rendered}"
         );
-    }
-
-    /// Exactly one env-loaded schema binds flat external maps (no DEFAULT_ID).
-    #[test]
-    fn sole_env_schema_binds_flat_external_payload() {
-        use rmpv::Value;
-
-        use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::MetricsSchemaV1;
-
-        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
-        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
-            "schema_version": 1,
-            "connector_id": "RedhareConnector",
-            "metrics": [{
-                "name": "redhare_put",
-                "type": "counter",
-                "samples_path": "put_total",
-                "sample_kind": "inc_by_u64"
-            }]
-        }))
-        .unwrap();
-        let generic = SchemaDrivenAdapter::with_builtins_and_sole_env_schema(metrics, schema);
-
-        let mut other = BTreeMap::new();
-        other.insert("put_total".to_string(), Value::from(11u64));
-        let stats = SchedulerStats {
-            kv_connector_stats: Some(KvConnectorStats::Other(other)),
-            ..Default::default()
-        };
-        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
-
-        let rendered = metrics.render().unwrap();
-        assert!(
-            rendered.contains("redhare_put_total{engine=\"0\",model_name=\"model\"} 11"),
-            "sole env schema should bind flat external payload:\n{rendered}"
-        );
+        assert!(generic.registered_ids().is_empty());
     }
 }
