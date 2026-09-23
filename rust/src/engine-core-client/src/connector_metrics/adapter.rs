@@ -9,12 +9,12 @@ use parking_lot::RwLock;
 use rmpv::Value;
 use tracing::warn;
 use vllm_metrics::{
-    connector_metric_labels, ConnectorMetricLabels, Family, F64Counter, F64Gauge, Histogram,
-    MetricConstructor, Metrics, U64Counter, U64Gauge,
+    ConnectorMetricLabels, F64Counter, F64Gauge, Family, Histogram, MetricConstructor, Metrics,
+    U64Counter, U64Gauge, connector_metric_labels,
 };
 
 use super::schema::{
-    MetricDef, MetricType, MetricsSchemaV1, SampleKind, METRICS_SCHEMA_KEY, SCHEMA_VERSION_V1,
+    METRICS_SCHEMA_KEY, MetricDef, MetricType, MetricsSchemaV1, SCHEMA_VERSION_V1, SampleKind,
 };
 
 const ENV_SCHEMA_PATHS: &str = "VLLM_KV_CONNECTOR_METRICS_SCHEMA";
@@ -69,7 +69,7 @@ pub(crate) struct SchemaDrivenAdapter {
 }
 
 impl SchemaDrivenAdapter {
-    /// Load schemas from env and register them on the process metrics object.
+    /// Register in-tree builtin schemas, then env paths (env overrides by id).
     pub(crate) fn from_env(metrics: &'static Metrics) -> Self {
         let default_connector_id = std::env::var(ENV_DEFAULT_CONNECTOR_ID)
             .ok()
@@ -82,17 +82,16 @@ impl SchemaDrivenAdapter {
             warned_missing: Mutex::new(BTreeSet::new()),
             warned_bad_schema: Mutex::new(BTreeSet::new()),
         };
+
+        let mut schemas: BTreeMap<String, MetricsSchemaV1> = BTreeMap::new();
+        for schema in builtin_schemas() {
+            schemas.insert(schema.connector_id.clone(), schema);
+        }
         if let Ok(paths) = std::env::var(ENV_SCHEMA_PATHS) {
             for path in paths.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                 match load_schema_file(path) {
                     Ok(schema) => {
-                        if let Err(err) = adapter.ensure_registered(schema) {
-                            warn!(
-                                path,
-                                error = %err,
-                                "failed to register KV connector metrics schema"
-                            );
-                        }
+                        schemas.insert(schema.connector_id.clone(), schema);
                     }
                     Err(err) => {
                         warn!(
@@ -104,10 +103,18 @@ impl SchemaDrivenAdapter {
                 }
             }
         }
+        for schema in schemas.into_values() {
+            if let Err(err) = adapter.ensure_registered(schema) {
+                warn!(
+                    error = %err,
+                    "failed to register KV connector metrics schema"
+                );
+            }
+        }
         adapter
     }
 
-    /// Construct an empty adapter (tests).
+    /// Construct an empty adapter (tests) — no builtins, no env.
     #[cfg(test)]
     pub(crate) fn empty(metrics: &'static Metrics) -> Self {
         Self {
@@ -117,6 +124,16 @@ impl SchemaDrivenAdapter {
             warned_missing: Mutex::new(BTreeSet::new()),
             warned_bad_schema: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Register only in-tree builtins (tests / zero-env Offloading path).
+    #[cfg(test)]
+    pub(crate) fn with_builtins(metrics: &'static Metrics) -> Self {
+        let adapter = Self::empty(metrics);
+        for schema in builtin_schemas() {
+            adapter.ensure_registered(schema).expect("builtin schema must validate");
+        }
+        adapter
     }
 
     #[cfg(test)]
@@ -192,10 +209,7 @@ impl SchemaDrivenAdapter {
                 let family = self.register_family(def, &reg_name)?;
                 families.insert(reg_name.clone(), family);
             }
-            let family = families
-                .get(&reg_name)
-                .expect("family just inserted")
-                .clone_family()?;
+            let family = families.get(&reg_name).expect("family just inserted").clone_family()?;
             metrics.push(BoundMetric {
                 def: def.clone(),
                 family,
@@ -305,17 +319,47 @@ fn strip_counter_total_suffix<'a>(name: &'a str, metric_type: &MetricType) -> &'
 }
 
 fn load_schema_file(path: &str) -> Result<MetricsSchemaV1, String> {
-    let raw = std::fs::read_to_string(Path::new(path))
-        .map_err(|err| format!("read {path}: {err}"))?;
+    let raw =
+        std::fs::read_to_string(Path::new(path)).map_err(|err| format!("read {path}: {err}"))?;
+    parse_schema_json(&raw, path)
+}
+
+fn parse_schema_json(raw: &str, source: &str) -> Result<MetricsSchemaV1, String> {
     let schema: MetricsSchemaV1 =
-        serde_json::from_str(&raw).map_err(|err| format!("parse {path}: {err}"))?;
+        serde_json::from_str(raw).map_err(|err| format!("parse {source}: {err}"))?;
     if schema.schema_version != SCHEMA_VERSION_V1 {
         return Err(format!(
-            "unsupported schema_version {} in {path}",
+            "unsupported schema_version {} in {source}",
             schema.schema_version
         ));
     }
     Ok(schema)
+}
+
+/// In-tree connector schemas auto-registered without env.
+fn builtin_schemas() -> Vec<MetricsSchemaV1> {
+    const BUILTINS: &[(&str, &str)] = &[
+        (
+            "offloading_connector_metrics_v1.json",
+            include_str!("builtins/offloading_connector_metrics_v1.json"),
+        ),
+        (
+            "hf3fs_connector_metrics_v1.json",
+            include_str!("builtins/hf3fs_connector_metrics_v1.json"),
+        ),
+        (
+            "hisparse_connector_metrics_v1.json",
+            include_str!("builtins/hisparse_connector_metrics_v1.json"),
+        ),
+    ];
+    let mut out = Vec::with_capacity(BUILTINS.len());
+    for (name, raw) in BUILTINS {
+        match parse_schema_json(raw, name) {
+            Ok(schema) => out.push(schema),
+            Err(err) => warn!(schema = *name, error = %err, "invalid builtin KV connector schema"),
+        }
+    }
+    out
 }
 
 fn rmpv_to_schema(value: &Value) -> Result<MetricsSchemaV1, String> {
@@ -336,12 +380,8 @@ fn map_remove(payload: &mut Value, key: &str) -> Option<Value> {
 }
 
 fn observe_metric(bound: &BoundMetric, model_name: &str, engine: u32, payload: &Value) {
-    let const_labels: Vec<(String, String)> = bound
-        .def
-        .const_labels
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let const_labels: Vec<(String, String)> =
+        bound.def.const_labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let labels = connector_metric_labels(model_name, engine, &const_labels);
     let Some(sample) = value_at_path(payload, &bound.def.samples_path) else {
         return;
@@ -411,9 +451,7 @@ fn unwrap_label_tuple_map(sample: &Value) -> &Value {
     if !all_array_keys {
         return sample;
     }
-    if let Some((_, v)) = entries
-        .iter()
-        .find(|(k, _)| matches!(k, Value::Array(a) if a.is_empty()))
+    if let Some((_, v)) = entries.iter().find(|(k, _)| matches!(k, Value::Array(a) if a.is_empty()))
     {
         return v;
     }

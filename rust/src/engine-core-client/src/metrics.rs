@@ -7,12 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
     EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric, LoraAdapterNames,
-    LoraInfoLabels, Metrics, MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily,
-    MooncakeOperationLabels, RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics,
-    U64Counter, U64Gauge, WaitingReasonLabels, METRICS,
+    LoraInfoLabels, METRICS, Metrics, MooncakeOperationCounterFamily,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RequestMetrics,
+    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
-use crate::connector_metrics::{observe_opaque_connector_stats, SchemaDrivenAdapter};
+use crate::connector_metrics::{SchemaDrivenAdapter, observe_opaque_connector_stats};
 use crate::protocol::stats::{
     KvConnectorStats, MooncakeStats, MultiConnectorStats, NixlStats, SchedulerStats,
 };
@@ -318,9 +318,7 @@ fn record_scheduler_stats_with_handles(
         match kv_connector_stats {
             KvConnectorStats::Nixl(stats) => record_nixl_stats(handles, stats),
             KvConnectorStats::Mooncake(stats) => record_mooncake_stats(handles, stats),
-            KvConnectorStats::Multi(stats) => {
-                record_multi_connector_stats(handles, stats, generic)
-            }
+            KvConnectorStats::Multi(stats) => record_multi_connector_stats(handles, stats, generic),
             KvConnectorStats::Other(map) => {
                 observe_opaque_connector_stats(
                     generic,
@@ -736,9 +734,8 @@ mod tests {
             "missing load_bytes in:\n{rendered}"
         );
         assert!(
-            rendered.contains(
-                "vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"model\"} 1.5"
-            ),
+            rendered
+                .contains("vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"model\"} 1.5"),
             "missing load_time in:\n{rendered}"
         );
         assert!(
@@ -748,9 +745,8 @@ mod tests {
             "missing gauge in:\n{rendered}"
         );
         assert!(
-            rendered.contains(
-                "vllm:kv_offload_load_size_count{engine=\"0\",model_name=\"model\"} 2"
-            ),
+            rendered
+                .contains("vllm:kv_offload_load_size_count{engine=\"0\",model_name=\"model\"} 2"),
             "missing histogram in:\n{rendered}"
         );
     }
@@ -767,7 +763,11 @@ mod tests {
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
         let generic = SchemaDrivenAdapter::empty(metrics);
         for (id, path, kind) in [
-            ("OffloadingConnector", "data.vllm:kv_offload_store_bytes", "inc_by_u64"),
+            (
+                "OffloadingConnector",
+                "data.vllm:kv_offload_store_bytes",
+                "inc_by_u64",
+            ),
             ("RedhareConnector", "put_total", "inc_by_u64"),
         ] {
             let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
@@ -807,10 +807,7 @@ mod tests {
         other.insert(
             "RedhareConnector".to_string(),
             Value::Map(
-                redhare_map
-                    .into_iter()
-                    .map(|(k, v)| (Value::String(k.into()), v))
-                    .collect(),
+                redhare_map.into_iter().map(|(k, v)| (Value::String(k.into()), v)).collect(),
             ),
         );
 
@@ -833,6 +830,81 @@ mod tests {
         assert!(
             rendered.contains("redhare_put_total{engine=\"0\",model_name=\"model\"} 7"),
             "missing nested redhare in:\n{rendered}"
+        );
+    }
+
+    /// In-tree Offloading works from builtins with no SCHEMA env / DEFAULT_ID.
+    #[test]
+    fn builtin_offloading_schema_observes_without_env() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::SchemaDrivenAdapter;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = SchemaDrivenAdapter::with_builtins(metrics);
+        assert!(
+            generic.registered_ids().iter().any(|id| id == "OffloadingConnector"),
+            "Offloading must be auto-registered: {:?}",
+            generic.registered_ids()
+        );
+
+        let empty_tuple = Value::Array(vec![]);
+        let mut other = BTreeMap::new();
+        other.insert("types".to_string(), Value::Map(vec![]));
+        other.insert(
+            "data".to_string(),
+            Value::Map(vec![(
+                Value::String("vllm:kv_offload_store_bytes".into()),
+                Value::Map(vec![(empty_tuple, Value::from(99u64))]),
+            )]),
+        );
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(other)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"model\"} 99"
+            ),
+            "builtin Offloading should observe without env:\n{rendered}"
+        );
+    }
+
+    /// Out-of-tree flat stats still need an explicit schema (env / payload).
+    #[test]
+    fn external_flat_connector_without_schema_is_not_recorded() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::SchemaDrivenAdapter;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        // Builtins only — no Redhare schema, no DEFAULT_ID.
+        let generic = SchemaDrivenAdapter::with_builtins(metrics);
+
+        let mut other = BTreeMap::new();
+        other.insert("put_total".to_string(), Value::from(5u64));
+        other.insert("bytes_put".to_string(), Value::from(100u64));
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(other)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            !rendered.contains("redhare_put"),
+            "external metrics must not appear without schema:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("put_total{"),
+            "unregistered flat fields must not become Prom series:\n{rendered}"
         );
     }
 }

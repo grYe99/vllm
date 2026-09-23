@@ -26,10 +26,8 @@ pub(crate) fn observe_opaque_connector_stats(
         return;
     }
 
-    let child_keys: Vec<&String> = map
-        .keys()
-        .filter(|k| looks_like_connector_class_name(k))
-        .collect();
+    let child_keys: Vec<&String> =
+        map.keys().filter(|k| looks_like_connector_class_name(k)).collect();
 
     if !child_keys.is_empty() {
         for key in child_keys {
@@ -43,28 +41,56 @@ pub(crate) fn observe_opaque_connector_stats(
         return;
     }
 
-    // Flat single-connector payload (e.g. Redhare `to_dict()` = stats data).
+    // Flat single-connector payload (e.g. Redhare `to_dict()` = stats data,
+    // or Offloading `{types,data}`).
     let payload = Value::Map(
-        map.iter()
-            .map(|(k, v)| (Value::String(k.as_str().into()), v.clone()))
-            .collect(),
+        map.iter().map(|(k, v)| (Value::String(k.as_str().into()), v.clone())).collect(),
     );
-    match resolve_flat_connector_id(generic) {
+    match resolve_flat_connector_id(generic, map) {
         Some(connector_id) => generic.observe(&connector_id, model_name, engine, &payload),
         None => generic.observe("<unknown>", model_name, engine, &payload),
     }
 }
 
-fn resolve_flat_connector_id(generic: &SchemaDrivenAdapter) -> Option<String> {
+fn resolve_flat_connector_id(
+    generic: &SchemaDrivenAdapter,
+    map: &BTreeMap<String, Value>,
+) -> Option<String> {
     if let Some(id) = generic.default_connector_id() {
         return Some(id.to_string());
     }
-    let mut ids = generic.registered_ids();
+    let ids = generic.registered_ids();
     if ids.len() == 1 {
-        ids.pop()
-    } else {
-        None
+        return ids.into_iter().next();
     }
+    // With multiple builtins registered, bind by distinctive payload shape so
+    // in-tree connectors need no DEFAULT_ID / SCHEMA env.
+    if let Some(id) = infer_connector_id_from_payload(map) {
+        if ids.iter().any(|registered| registered == &id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn infer_connector_id_from_payload(map: &BTreeMap<String, Value>) -> Option<String> {
+    if map.contains_key("types") && map.contains_key("data") {
+        return Some("OffloadingConnector".to_string());
+    }
+    if map.contains_key("save_duration")
+        || map.contains_key("load_duration")
+        || map.contains_key("num_failed_save")
+        || map.contains_key("num_failed_load")
+    {
+        return Some("HF3FSKVConnector".to_string());
+    }
+    if map.contains_key("cache_hits")
+        || map.contains_key("cache_misses")
+        || map.contains_key("host_to_device_bytes")
+    {
+        return Some("HiSparseConnector".to_string());
+    }
+    None
 }
 
 fn is_builtin_connector_id(id: &str) -> bool {
