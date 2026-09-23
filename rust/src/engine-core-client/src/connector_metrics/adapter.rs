@@ -18,7 +18,6 @@ use super::schema::{
 };
 
 const ENV_SCHEMA_PATHS: &str = "VLLM_KV_CONNECTOR_METRICS_SCHEMA";
-const ENV_DEFAULT_CONNECTOR_ID: &str = "VLLM_KV_CONNECTOR_METRICS_DEFAULT_ID";
 
 #[derive(Clone)]
 struct HistogramBuckets(Arc<Vec<f64>>);
@@ -62,8 +61,9 @@ struct SchemaInstance {
 pub(crate) struct SchemaDrivenAdapter {
     metrics: &'static Metrics,
     instances: RwLock<BTreeMap<String, SchemaInstance>>,
-    /// Connector id used when the wire payload is a flat stats dict.
-    default_connector_id: Option<String>,
+    /// When exactly one schema was loaded from `VLLM_KV_CONNECTOR_METRICS_SCHEMA`,
+    /// flat opaque maps bind to this `connector_id` (no second env var).
+    sole_env_connector_id: Option<String>,
     warned_missing: Mutex<BTreeSet<String>>,
     warned_bad_schema: Mutex<BTreeSet<String>>,
 }
@@ -71,27 +71,17 @@ pub(crate) struct SchemaDrivenAdapter {
 impl SchemaDrivenAdapter {
     /// Register in-tree builtin schemas, then env paths (env overrides by id).
     pub(crate) fn from_env(metrics: &'static Metrics) -> Self {
-        let default_connector_id = std::env::var(ENV_DEFAULT_CONNECTOR_ID)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let adapter = Self {
-            metrics,
-            instances: RwLock::new(BTreeMap::new()),
-            default_connector_id,
-            warned_missing: Mutex::new(BTreeSet::new()),
-            warned_bad_schema: Mutex::new(BTreeSet::new()),
-        };
-
-        let mut schemas: BTreeMap<String, MetricsSchemaV1> = BTreeMap::new();
+        let mut builtin: BTreeMap<String, MetricsSchemaV1> = BTreeMap::new();
         for schema in builtin_schemas() {
-            schemas.insert(schema.connector_id.clone(), schema);
+            builtin.insert(schema.connector_id.clone(), schema);
         }
+
+        let mut from_env: BTreeMap<String, MetricsSchemaV1> = BTreeMap::new();
         if let Ok(paths) = std::env::var(ENV_SCHEMA_PATHS) {
             for path in paths.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                 match load_schema_file(path) {
                     Ok(schema) => {
-                        schemas.insert(schema.connector_id.clone(), schema);
+                        from_env.insert(schema.connector_id.clone(), schema);
                     }
                     Err(err) => {
                         warn!(
@@ -103,6 +93,25 @@ impl SchemaDrivenAdapter {
                 }
             }
         }
+
+        let sole_env_connector_id = if from_env.len() == 1 {
+            from_env.keys().next().cloned()
+        } else {
+            None
+        };
+
+        let mut schemas = builtin;
+        for (id, schema) in from_env {
+            schemas.insert(id, schema);
+        }
+
+        let adapter = Self {
+            metrics,
+            instances: RwLock::new(BTreeMap::new()),
+            sole_env_connector_id,
+            warned_missing: Mutex::new(BTreeSet::new()),
+            warned_bad_schema: Mutex::new(BTreeSet::new()),
+        };
         for schema in schemas.into_values() {
             if let Err(err) = adapter.ensure_registered(schema) {
                 warn!(
@@ -120,7 +129,7 @@ impl SchemaDrivenAdapter {
         Self {
             metrics,
             instances: RwLock::new(BTreeMap::new()),
-            default_connector_id: None,
+            sole_env_connector_id: None,
             warned_missing: Mutex::new(BTreeSet::new()),
             warned_bad_schema: Mutex::new(BTreeSet::new()),
         }
@@ -136,14 +145,45 @@ impl SchemaDrivenAdapter {
         adapter
     }
 
+    /// Register one schema as if it were the sole env-loaded schema (tests).
     #[cfg(test)]
-    pub(crate) fn with_default_id(mut self, connector_id: impl Into<String>) -> Self {
-        self.default_connector_id = Some(connector_id.into());
-        self
+    pub(crate) fn with_sole_env_schema(metrics: &'static Metrics, schema: MetricsSchemaV1) -> Self {
+        let id = schema.connector_id.clone();
+        let adapter = Self {
+            metrics,
+            instances: RwLock::new(BTreeMap::new()),
+            sole_env_connector_id: Some(id),
+            warned_missing: Mutex::new(BTreeSet::new()),
+            warned_bad_schema: Mutex::new(BTreeSet::new()),
+        };
+        adapter.ensure_registered(schema).expect("test schema must validate");
+        adapter
     }
 
-    pub(crate) fn default_connector_id(&self) -> Option<&str> {
-        self.default_connector_id.as_deref()
+    /// Builtins plus one env schema (production-like flat external binding).
+    #[cfg(test)]
+    pub(crate) fn with_builtins_and_sole_env_schema(
+        metrics: &'static Metrics,
+        schema: MetricsSchemaV1,
+    ) -> Self {
+        let id = schema.connector_id.clone();
+        let adapter = Self {
+            metrics,
+            instances: RwLock::new(BTreeMap::new()),
+            sole_env_connector_id: Some(id),
+            warned_missing: Mutex::new(BTreeSet::new()),
+            warned_bad_schema: Mutex::new(BTreeSet::new()),
+        };
+        for builtin in builtin_schemas() {
+            adapter.ensure_registered(builtin).expect("builtin schema must validate");
+        }
+        adapter.ensure_registered(schema).expect("test schema must validate");
+        adapter
+    }
+
+    /// Sole env-loaded connector id, when exactly one schema came from env.
+    pub(crate) fn sole_env_connector_id(&self) -> Option<&str> {
+        self.sole_env_connector_id.as_deref()
     }
 
     pub(crate) fn registered_ids(&self) -> Vec<String> {

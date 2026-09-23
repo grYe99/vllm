@@ -595,7 +595,6 @@ mod tests {
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::empty(metrics).with_default_id("FakeConnector");
         let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "connector_id": "FakeConnector",
@@ -619,7 +618,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        generic.ensure_registered(schema).unwrap();
+        let generic = SchemaDrivenAdapter::with_sole_env_schema(metrics, schema);
 
         let mut other = BTreeMap::new();
         other.insert("put_total".to_string(), Value::from(3u64));
@@ -659,7 +658,6 @@ mod tests {
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::empty(metrics).with_default_id("OffloadingConnector");
         let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "connector_id": "OffloadingConnector",
@@ -692,6 +690,8 @@ mod tests {
             ]
         }))
         .unwrap();
+        // Single registered schema (no DEFAULT_ID): flat Other binds by id count.
+        let generic = SchemaDrivenAdapter::empty(metrics);
         generic.ensure_registered(schema).unwrap();
 
         let empty_tuple = Value::Array(vec![]);
@@ -833,7 +833,7 @@ mod tests {
         );
     }
 
-    /// In-tree Offloading works from builtins with no SCHEMA env / DEFAULT_ID.
+    /// In-tree Offloading works from builtins with no SCHEMA env.
     #[test]
     fn builtin_offloading_schema_observes_without_env() {
         use rmpv::Value;
@@ -884,7 +884,7 @@ mod tests {
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        // Builtins only — no Redhare schema, no DEFAULT_ID.
+        // Builtins only — no Redhare schema / sole-env binding.
         let generic = SchemaDrivenAdapter::with_builtins(metrics);
 
         let mut other = BTreeMap::new();
@@ -905,6 +905,44 @@ mod tests {
         assert!(
             !rendered.contains("put_total{"),
             "unregistered flat fields must not become Prom series:\n{rendered}"
+        );
+    }
+
+    /// Exactly one env-loaded schema binds flat external maps (no DEFAULT_ID).
+    #[test]
+    fn sole_env_schema_binds_flat_external_payload() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::SchemaDrivenAdapter;
+        use crate::connector_metrics::schema::MetricsSchemaV1;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let schema: MetricsSchemaV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "connector_id": "RedhareConnector",
+            "metrics": [{
+                "name": "redhare_put",
+                "type": "counter",
+                "samples_path": "put_total",
+                "sample_kind": "inc_by_u64"
+            }]
+        }))
+        .unwrap();
+        let generic = SchemaDrivenAdapter::with_builtins_and_sole_env_schema(metrics, schema);
+
+        let mut other = BTreeMap::new();
+        other.insert("put_total".to_string(), Value::from(11u64));
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(other)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains("redhare_put_total{engine=\"0\",model_name=\"model\"} 11"),
+            "sole env schema should bind flat external payload:\n{rendered}"
         );
     }
 }

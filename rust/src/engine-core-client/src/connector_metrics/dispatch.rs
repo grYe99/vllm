@@ -56,20 +56,22 @@ fn resolve_flat_connector_id(
     generic: &SchemaDrivenAdapter,
     map: &BTreeMap<String, Value>,
 ) -> Option<String> {
-    if let Some(id) = generic.default_connector_id() {
+    // 1) Exactly one schema loaded from env → bind flat maps to that id.
+    if let Some(id) = generic.sole_env_connector_id() {
         return Some(id.to_string());
     }
     let ids = generic.registered_ids();
+    // 2) Only one schema registered overall (e.g. tests without builtins).
     if ids.len() == 1 {
         return ids.into_iter().next();
     }
-    // With multiple builtins registered, bind by distinctive payload shape so
-    // in-tree connectors need no DEFAULT_ID / SCHEMA env.
+    // 3) Distinctive in-tree payload shapes against registered schemas.
     if let Some(id) = infer_connector_id_from_payload(map) {
         if ids.iter().any(|registered| registered == &id) {
             return Some(id);
         }
     }
+    // 4) Ambiguous → caller warns via observe("<unknown>").
     None
 }
 
