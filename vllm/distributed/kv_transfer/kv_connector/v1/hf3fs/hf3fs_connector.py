@@ -1021,8 +1021,8 @@ class HF3FSKVConnector(KVConnectorBase_V1):
         return (num_tokens // self._block_size) * self._block_size
 
 
-# Single source for Python Prom and Rust MetricsSchemaV1.
-_HF3FS_DURATION_BUCKETS = (
+# Duration histogram buckets (must match HF3FSPromMetrics / schema).
+_HF3FS_DURATION_BUCKETS = [
     0.001,
     0.005,
     0.01,
@@ -1036,67 +1036,44 @@ _HF3FS_DURATION_BUCKETS = (
     0.75,
     1.0,
     5.0,
-)
-
-
-@dataclass(frozen=True)
-class _HF3FSMetricDef:
-    wire_key: str
-    name: str
-    metric_type: str
-    documentation: str
-    sample_kind: str
-    buckets: tuple[float, ...] | None = None
-
-
-_HF3FS_METRIC_DEFS: tuple[_HF3FSMetricDef, ...] = (
-    _HF3FSMetricDef(
-        wire_key="save_duration",
-        name="vllm:hf3fs_save_duration_seconds",
-        metric_type="histogram",
-        documentation="Histogram of save duration for HF3FSKVConnector.",
-        sample_kind=OBSERVE_EACH_F64,
-        buckets=_HF3FS_DURATION_BUCKETS,
-    ),
-    _HF3FSMetricDef(
-        wire_key="load_duration",
-        name="vllm:hf3fs_load_duration_seconds",
-        metric_type="histogram",
-        documentation="Histogram of load duration for HF3FSKVConnector.",
-        sample_kind=OBSERVE_EACH_F64,
-        buckets=_HF3FS_DURATION_BUCKETS,
-    ),
-    _HF3FSMetricDef(
-        wire_key="num_failed_save",
-        name="vllm:hf3fs_num_failed_save",
-        metric_type="counter",
-        documentation="Number of failed HF3FS KV save.",
-        sample_kind=INC_BY_U64,
-    ),
-    _HF3FSMetricDef(
-        wire_key="num_failed_load",
-        name="vllm:hf3fs_num_failed_load",
-        metric_type="counter",
-        documentation="Number of failed HF3FS KV load.",
-        sample_kind=INC_BY_U64,
-    ),
-)
+]
 
 
 def build_hf3fs_metrics_schema() -> dict[str, Any]:
-    """Derive MetricsSchemaV1 from ``_HF3FS_METRIC_DEFS`` (same as Prom)."""
+    """Build MetricsSchemaV1 matching HF3FSPromMetrics names/docs/buckets."""
     return build_metrics_schema(
         "HF3FSKVConnector",
         [
             metric_def(
-                name=defn.name,
-                type=defn.metric_type,
-                documentation=defn.documentation,
-                samples_path=defn.wire_key,
-                sample_kind=defn.sample_kind,
-                buckets=defn.buckets,
-            )
-            for defn in _HF3FS_METRIC_DEFS
+                name="vllm:hf3fs_save_duration_seconds",
+                type="histogram",
+                documentation="Histogram of save duration for HF3FSKVConnector.",
+                samples_path="save_duration",
+                sample_kind=OBSERVE_EACH_F64,
+                buckets=_HF3FS_DURATION_BUCKETS,
+            ),
+            metric_def(
+                name="vllm:hf3fs_load_duration_seconds",
+                type="histogram",
+                documentation="Histogram of load duration for HF3FSKVConnector.",
+                samples_path="load_duration",
+                sample_kind=OBSERVE_EACH_F64,
+                buckets=_HF3FS_DURATION_BUCKETS,
+            ),
+            metric_def(
+                name="vllm:hf3fs_num_failed_save",
+                type="counter",
+                documentation="Number of failed HF3FS KV save.",
+                samples_path="num_failed_save",
+                sample_kind=INC_BY_U64,
+            ),
+            metric_def(
+                name="vllm:hf3fs_num_failed_load",
+                type="counter",
+                documentation="Number of failed HF3FS KV load.",
+                samples_path="num_failed_load",
+                sample_kind=INC_BY_U64,
+            ),
         ],
     )
 
@@ -1214,42 +1191,80 @@ class HF3FSPromMetrics(KVConnectorPromMetrics):
         per_engine_labelvalues: dict[int, list[object]],
     ):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
-        self._histograms: dict[str, Any] = {}
-        self._counters: dict[str, Any] = {}
-        for defn in _HF3FS_METRIC_DEFS:
-            if defn.metric_type == "histogram":
-                assert defn.buckets is not None
-                family = self._histogram_cls(
-                    name=defn.name,
-                    documentation=defn.documentation,
-                    buckets=list(defn.buckets),
-                    labelnames=labelnames,
-                )
-                self._histograms[defn.wire_key] = create_metric_per_engine(
-                    family, self.per_engine_labelvalues
-                )
-            elif defn.metric_type == "counter":
-                family = self._counter_cls(
-                    name=defn.name,
-                    documentation=defn.documentation,
-                    labelnames=labelnames,
-                )
-                self._counters[defn.wire_key] = create_metric_per_engine(
-                    family, self.per_engine_labelvalues
-                )
-            else:
-                raise AssertionError(
-                    f"Unsupported HF3FS metric type: {defn.metric_type}"
-                )
-        # Keep historical attribute names for any external references.
-        self.hf3fs_save_duration = self._histograms["save_duration"]
-        self.hf3fs_load_duration = self._histograms["load_duration"]
-        self.hf3fs_num_failed_save = self._counters["num_failed_save"]
-        self.hf3fs_num_failed_load = self._counters["num_failed_load"]
+        buckets = [
+            0.001,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.075,
+            0.1,
+            0.2,
+            0.3,
+            0.5,
+            0.75,
+            1.0,
+            5.0,
+        ]
+        hf3fs_save_duration = self._histogram_cls(
+            name="vllm:hf3fs_save_duration_seconds",
+            documentation="Histogram of save duration for HF3FSKVConnector.",
+            buckets=buckets,
+            labelnames=labelnames,
+        )
+        self.hf3fs_save_duration = create_metric_per_engine(
+            hf3fs_save_duration, self.per_engine_labelvalues
+        )
+
+        hf3fs_load_duration = self._histogram_cls(
+            name="vllm:hf3fs_load_duration_seconds",
+            documentation="Histogram of load duration for HF3FSKVConnector.",
+            buckets=buckets,
+            labelnames=labelnames,
+        )
+        self.hf3fs_load_duration = create_metric_per_engine(
+            hf3fs_load_duration, self.per_engine_labelvalues
+        )
+
+        hf3fs_num_failed_save = self._counter_cls(
+            name="vllm:hf3fs_num_failed_save",
+            documentation="Number of failed HF3FS KV save.",
+            labelnames=labelnames,
+        )
+        self.hf3fs_num_failed_save = create_metric_per_engine(
+            hf3fs_num_failed_save, self.per_engine_labelvalues
+        )
+
+        hf3fs_num_failed_load = self._counter_cls(
+            name="vllm:hf3fs_num_failed_load",
+            documentation="Number of failed HF3FS KV load.",
+            labelnames=labelnames,
+        )
+        self.hf3fs_num_failed_load = create_metric_per_engine(
+            hf3fs_num_failed_load, self.per_engine_labelvalues
+        )
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
-        for wire_key, prom_obj in self._histograms.items():
-            for list_item in transfer_stats_data[wire_key]:
+        for prom_obj, list_item_key in zip(
+            [
+                self.hf3fs_save_duration,
+                self.hf3fs_load_duration,
+            ],
+            [
+                "save_duration",
+                "load_duration",
+            ],
+        ):
+            for list_item in transfer_stats_data[list_item_key]:
                 prom_obj[engine_idx].observe(list_item)
-        for wire_key, counter_obj in self._counters.items():
-            counter_obj[engine_idx].inc(transfer_stats_data[wire_key])
+        for counter_obj, counter_item_key in zip(
+            [
+                self.hf3fs_num_failed_save,
+                self.hf3fs_num_failed_load,
+            ],
+            [
+                "num_failed_save",
+                "num_failed_load",
+            ],
+        ):
+            counter_obj[engine_idx].inc(transfer_stats_data[counter_item_key])

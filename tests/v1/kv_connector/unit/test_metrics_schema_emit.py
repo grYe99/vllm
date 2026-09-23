@@ -3,7 +3,6 @@
 """Unit tests for Rust-frontend-gated ``_metrics_schema`` emission."""
 
 from vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector import (
-    _HF3FS_METRIC_DEFS,
     HF3FSKVConnectorStats,
     build_hf3fs_metrics_schema,
 )
@@ -122,18 +121,48 @@ def test_offloading_metrics_schema_derived_from_metadata():
             raise AssertionError(f"unexpected metadata: {metadata}")
 
 
-def test_hf3fs_metrics_schema_derived_from_metric_defs():
-    """Schema matches ``_HF3FS_METRIC_DEFS`` used by Prom (no JSON file)."""
+def test_hf3fs_metrics_schema_matches_prom_names():
+    """Schema names/kinds/buckets match HF3FSPromMetrics (no JSON / table)."""
     schema = build_hf3fs_metrics_schema()
     assert schema["connector_id"] == "HF3FSKVConnector"
-    assert len(schema["metrics"]) == len(_HF3FS_METRIC_DEFS)
-    for entry, defn in zip(schema["metrics"], _HF3FS_METRIC_DEFS, strict=True):
-        assert entry["name"] == defn.name
-        assert entry["type"] == defn.metric_type
-        assert entry["samples_path"] == defn.wire_key
-        assert entry["sample_kind"] == defn.sample_kind
-        if defn.buckets is not None:
-            assert entry["buckets"] == list(defn.buckets)
+    by_name = {m["name"]: m for m in schema["metrics"]}
+    assert set(by_name) == {
+        "vllm:hf3fs_save_duration_seconds",
+        "vllm:hf3fs_load_duration_seconds",
+        "vllm:hf3fs_num_failed_save",
+        "vllm:hf3fs_num_failed_load",
+    }
+    for hist_name, wire_key in (
+        ("vllm:hf3fs_save_duration_seconds", "save_duration"),
+        ("vllm:hf3fs_load_duration_seconds", "load_duration"),
+    ):
+        entry = by_name[hist_name]
+        assert entry["type"] == "histogram"
+        assert entry["samples_path"] == wire_key
+        assert entry["sample_kind"] == OBSERVE_EACH_F64
+        assert entry["buckets"] == [
+            0.001,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.075,
+            0.1,
+            0.2,
+            0.3,
+            0.5,
+            0.75,
+            1.0,
+            5.0,
+        ]
+    for counter_name, wire_key in (
+        ("vllm:hf3fs_num_failed_save", "num_failed_save"),
+        ("vllm:hf3fs_num_failed_load", "num_failed_load"),
+    ):
+        entry = by_name[counter_name]
+        assert entry["type"] == "counter"
+        assert entry["samples_path"] == wire_key
+        assert entry["sample_kind"] == INC_BY_U64
 
 
 def test_hisparse_metrics_schema_derived_from_counters():
