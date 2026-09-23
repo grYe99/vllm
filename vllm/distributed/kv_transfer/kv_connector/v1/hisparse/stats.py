@@ -13,12 +13,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema import (
-    load_metrics_schema,
+    INC_BY_SUM_U64,
+    build_metrics_schema,
     maybe_attach_metrics_schema,
+    metric_def,
     strip_metrics_schema,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 
+# Single source for Python Prom and Rust MetricsSchemaV1 (wire key, docs).
 _HISPARSE_COUNTERS: tuple[tuple[str, str], ...] = (
     ("cache_hits", "Number of HiSparse device hot-buffer hits."),
     ("cache_misses", "Number of HiSparse device hot-buffer misses."),
@@ -27,6 +30,23 @@ _HISPARSE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Bytes transferred from host KV storage to HiSparse hot buffers.",
     ),
 )
+
+
+def build_hisparse_metrics_schema() -> dict[str, Any]:
+    """Derive MetricsSchemaV1 from ``_HISPARSE_COUNTERS`` (same as Prom)."""
+    return build_metrics_schema(
+        "HiSparseConnector",
+        [
+            metric_def(
+                name=f"vllm:hisparse_{wire_key}",
+                type="counter",
+                documentation=documentation,
+                samples_path=wire_key,
+                sample_kind=INC_BY_SUM_U64,
+            )
+            for wire_key, documentation in _HISPARSE_COUNTERS
+        ],
+    )
 
 
 @dataclass
@@ -48,9 +68,7 @@ class HiSparseKVConnectorStats(KVConnectorStats):
         return maybe_attach_metrics_schema(
             self.data,
             connector_id="HiSparseConnector",
-            schema=load_metrics_schema(
-                "vllm.distributed.kv_transfer.kv_connector.v1.hisparse"
-            ),
+            schema=build_hisparse_metrics_schema(),
         )
 
     def reset(self):

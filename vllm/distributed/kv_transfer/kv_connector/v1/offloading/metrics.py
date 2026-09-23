@@ -11,8 +11,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema import (
-    load_metrics_schema,
+    INC_BY_F64,
+    INC_BY_U64,
+    OBSERVE_EACH_F64,
+    SET_F64,
+    build_metrics_schema,
     maybe_attach_metrics_schema,
+    metric_def,
     strip_metrics_schema,
 )
 from vllm.v1.kv_offload.base import (
@@ -134,6 +139,70 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
     }
 
 
+# Float counters on the wire (seconds); all other counters are integer-valued.
+_FLOAT_COUNTER_NAMES = frozenset(
+    {
+        _TransferMetricName.LOAD_TIME,
+        _TransferMetricName.STORE_TIME,
+    }
+)
+
+
+def _sample_kind_for_offloading(name: str, metadata: OffloadingMetricMetadata) -> str:
+    """Map OffloadingMetricMetadata + wire value shape to Rust sample_kind."""
+    if isinstance(metadata, OffloadingHistogramMetadata):
+        return OBSERVE_EACH_F64
+    if isinstance(metadata, OffloadingGaugeMetadata):
+        return SET_F64
+    if isinstance(metadata, OffloadingCounterMetadata):
+        return INC_BY_F64 if name in _FLOAT_COUNTER_NAMES else INC_BY_U64
+    raise AssertionError(f"Unknown offloading metric metadata: {metadata}")
+
+
+def _metric_type_for_offloading(metadata: OffloadingMetricMetadata) -> str:
+    if isinstance(metadata, OffloadingHistogramMetadata):
+        return "histogram"
+    if isinstance(metadata, OffloadingGaugeMetadata):
+        return "gauge"
+    if isinstance(metadata, OffloadingCounterMetadata):
+        return "counter"
+    raise AssertionError(f"Unknown offloading metric metadata: {metadata}")
+
+
+def build_offloading_metrics_schema() -> dict[str, Any]:
+    """Derive MetricsSchemaV1 from OffloadingMetricMetadata (same as Prom).
+
+    Uses connector defs plus CPUOffloadingSpec defs (including optional
+    ``stores_skipped``). Tiering / other specs may emit additional wire
+    metrics that Prom registers at runtime; those are not in this static
+    schema until their metadata is folded into the emit path the same way.
+    """
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    # store_threshold>=2 includes STORES_SKIPPED so the schema covers the
+    # common CPU path without depending on runtime extra_config.
+    definitions: dict[str, OffloadingMetricMetadata] = {
+        **CPUOffloadingSpec.build_metric_definitions({"store_threshold": 2}),
+        **get_connector_metric_definitions(),
+    }
+    metrics = []
+    for name, metadata in definitions.items():
+        buckets = None
+        if isinstance(metadata, OffloadingHistogramMetadata):
+            buckets = metadata.buckets
+        metrics.append(
+            metric_def(
+                name=name,
+                type=_metric_type_for_offloading(metadata),
+                documentation=metadata.documentation,
+                samples_path=f"data.{name}",
+                sample_kind=_sample_kind_for_offloading(name, metadata),
+                buckets=buckets,
+            )
+        )
+    return build_metrics_schema("OffloadingConnector", metrics)
+
+
 _DEPRECATED_TOTAL_BYTES = "vllm:kv_offload_total_bytes"
 _DEPRECATED_TOTAL_TIME = "vllm:kv_offload_total_time"
 _DEPRECATED_SIZE = "vllm:kv_offload_size"
@@ -204,9 +273,7 @@ class OffloadingConnectorStats(KVConnectorStats):
         return maybe_attach_metrics_schema(
             self.data,
             connector_id="OffloadingConnector",
-            schema=load_metrics_schema(
-                "vllm.distributed.kv_transfer.kv_connector.v1.offloading"
-            ),
+            schema=build_offloading_metrics_schema(),
         )
 
     def reset(self):

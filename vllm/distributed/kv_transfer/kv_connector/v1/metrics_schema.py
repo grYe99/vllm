@@ -6,37 +6,70 @@ Rust frontend cannot call ``build_prom_metrics()``. Connectors that need
 schema-driven Prometheus series emit ``_metrics_schema`` once in their
 ``to_dict()`` payload when ``VLLM_USE_RUST_FRONTEND`` is enabled. Python
 frontend scrapes leave the payload untouched.
+
+In-tree builtins derive MetricsSchemaV1 from the same metric definitions
+used by Python Prom (or a shared declarative table), not from hand-maintained
+JSON files.
 """
 
 from __future__ import annotations
 
-import json
-from functools import lru_cache
-from importlib.resources import files
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import vllm.envs as envs
 
 METRICS_SCHEMA_KEY = "_metrics_schema"
+SCHEMA_VERSION = 1
+
+# Sample kinds must match Rust ``SampleKind`` (snake_case).
+INC_BY_U64 = "inc_by_u64"
+INC_BY_SUM_U64 = "inc_by_sum_u64"
+INC_BY_F64 = "inc_by_f64"
+SET_F64 = "set_f64"
+OBSERVE_EACH_F64 = "observe_each_f64"
 
 # Process-local: first to_dict per connector_id carries the schema.
 _emitted_connector_ids: set[str] = set()
 
 
-@lru_cache(maxsize=16)
-def load_metrics_schema(
-    package: str, resource_name: str = "metrics_schema_v1.json"
+def metric_def(
+    *,
+    name: str,
+    type: str,
+    documentation: str,
+    samples_path: str,
+    sample_kind: str,
+    buckets: Sequence[float] | None = None,
 ) -> dict[str, Any]:
-    """Load a MetricsSchemaV1 JSON document shipped beside a connector package."""
-    raw = files(package).joinpath(resource_name).read_text(encoding="utf-8")
-    schema: dict[str, Any] = json.loads(raw)
-    return schema
+    """Build one MetricsSchemaV1 metric entry."""
+    entry: dict[str, Any] = {
+        "name": name,
+        "type": type,
+        "documentation": documentation,
+        "samples_path": samples_path,
+        "sample_kind": sample_kind,
+    }
+    if buckets is not None:
+        entry["buckets"] = list(buckets)
+    return entry
+
+
+def build_metrics_schema(
+    connector_id: str,
+    metrics: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Assemble a MetricsSchemaV1 document for ``connector_id``."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "connector_id": connector_id,
+        "metrics": [dict(m) for m in metrics],
+    }
 
 
 def reset_metrics_schema_emission_for_tests() -> None:
     """Clear one-shot emission state (unit tests only)."""
     _emitted_connector_ids.clear()
-    load_metrics_schema.cache_clear()
 
 
 def strip_metrics_schema(data: dict[str, Any] | None) -> dict[str, Any] | None:
