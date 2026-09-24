@@ -1021,26 +1021,24 @@ class HF3FSKVConnector(KVConnectorBase_V1):
         return (num_tokens // self._block_size) * self._block_size
 
 
-# Duration histogram buckets (must match HF3FSPromMetrics / schema).
-_HF3FS_DURATION_BUCKETS = [
-    0.001,
-    0.005,
-    0.01,
-    0.025,
-    0.05,
-    0.075,
-    0.1,
-    0.2,
-    0.3,
-    0.5,
-    0.75,
-    1.0,
-    5.0,
-]
-
-
 def build_hf3fs_metrics_schema() -> dict[str, Any]:
     """Build MetricsSchemaV1 matching HF3FSPromMetrics names/docs/buckets."""
+    # Must match HF3FSPromMetrics.__init__ local buckets list.
+    duration_buckets = [
+        0.001,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.075,
+        0.1,
+        0.2,
+        0.3,
+        0.5,
+        0.75,
+        1.0,
+        5.0,
+    ]
     return build_metrics_schema(
         "HF3FSKVConnector",
         [
@@ -1050,7 +1048,7 @@ def build_hf3fs_metrics_schema() -> dict[str, Any]:
                 documentation="Histogram of save duration for HF3FSKVConnector.",
                 samples_path="save_duration",
                 sample_kind=OBSERVE_EACH_F64,
-                buckets=_HF3FS_DURATION_BUCKETS,
+                buckets=duration_buckets,
             ),
             metric_def(
                 name="vllm:hf3fs_load_duration_seconds",
@@ -1058,7 +1056,7 @@ def build_hf3fs_metrics_schema() -> dict[str, Any]:
                 documentation="Histogram of load duration for HF3FSKVConnector.",
                 samples_path="load_duration",
                 sample_kind=OBSERVE_EACH_F64,
-                buckets=_HF3FS_DURATION_BUCKETS,
+                buckets=duration_buckets,
             ),
             metric_def(
                 name="vllm:hf3fs_num_failed_save",
