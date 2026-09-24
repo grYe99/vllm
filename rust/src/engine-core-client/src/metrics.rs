@@ -7,11 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
     EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric, LoraAdapterNames,
-    LoraInfoLabels, MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily,
-    MooncakeOperationLabels, RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics,
-    U64Counter, U64Gauge, WaitingReasonLabels,
+    LoraInfoLabels, METRICS, Metrics, MooncakeOperationCounterFamily,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RequestMetrics,
+    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
+use crate::connector_metrics::{DescriptorDrivenAdapter, observe_opaque_connector_stats};
 use crate::protocol::stats::{
     KvConnectorStats, MooncakeStats, MultiConnectorStats, NixlStats, SchedulerStats,
 };
@@ -41,6 +42,8 @@ impl IterationMetricHandles {
 /// frontend client.
 pub(crate) struct SchedulerStatsRecorder {
     engines: BTreeMap<u32, SchedulerStatsHandles>,
+    /// Descriptor-driven recorder for third-party KV connector stats.
+    generic_connector_metrics: DescriptorDrivenAdapter,
 }
 
 /// Per-engine cached metric handles used while recording `SchedulerStats`.
@@ -106,6 +109,17 @@ impl SchedulerStatsRecorder {
         model_name: &str,
         engines: &[ConnectedEngine],
     ) -> Self {
+        Self::new_with_metrics(&*METRICS, metrics, model_name, engines)
+    }
+
+    /// Like [`Self::new`], but allows tests to inject a non-global metrics
+    /// registry for descriptor-driven connector families.
+    pub(crate) fn new_with_metrics(
+        root_metrics: &'static Metrics,
+        metrics: &SchedulerMetrics,
+        model_name: &str,
+        engines: &[ConnectedEngine],
+    ) -> Self {
         let engines = engines
             .iter()
             .filter_map(|engine| {
@@ -117,13 +131,16 @@ impl SchedulerStatsRecorder {
             })
             .collect();
 
-        Self { engines }
+        Self {
+            engines,
+            generic_connector_metrics: DescriptorDrivenAdapter::new(root_metrics),
+        }
     }
 
     /// Record one scheduler-stats payload for the given engine index.
     pub(crate) fn record(&self, engine_index: u32, stats: &SchedulerStats) {
         if let Some(handles) = self.engines.get(&engine_index) {
-            record_scheduler_stats_with_handles(handles, stats);
+            record_scheduler_stats_with_handles(handles, stats, &self.generic_connector_metrics);
         }
     }
 }
@@ -207,7 +224,11 @@ fn resolve_scheduler_stats_handles(
 }
 
 /// Record scheduler-stats values through pre-resolved metric handles.
-fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &SchedulerStats) {
+fn record_scheduler_stats_with_handles(
+    handles: &SchedulerStatsHandles,
+    stats: &SchedulerStats,
+    generic: &DescriptorDrivenAdapter,
+) {
     // Scheduler state gauges.
     handles.scheduler_running.set(stats.num_running_reqs);
     handles
@@ -291,23 +312,43 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
 
     // Connector-specific KV transfer stats. A bare connector reports its own
     // flat payload; MultiConnector reports connector class name -> flat child
-    // payload.
+    // payload. Unknown / third-party children go through the descriptor-driven
+    // generic adapter.
     if let Some(kv_connector_stats) = &stats.kv_connector_stats {
         match kv_connector_stats {
             KvConnectorStats::Nixl(stats) => record_nixl_stats(handles, stats),
             KvConnectorStats::Mooncake(stats) => record_mooncake_stats(handles, stats),
-            KvConnectorStats::Multi(stats) => record_multi_connector_stats(handles, stats),
-            KvConnectorStats::Other(_) => {}
+            KvConnectorStats::Multi(stats) => record_multi_connector_stats(handles, stats, generic),
+            KvConnectorStats::Other(map) => {
+                observe_opaque_connector_stats(
+                    generic,
+                    &handles.labels.model_name,
+                    handles.labels.engine,
+                    map,
+                );
+            }
         }
     }
 }
 
-fn record_multi_connector_stats(handles: &SchedulerStatsHandles, stats: &MultiConnectorStats) {
+fn record_multi_connector_stats(
+    handles: &SchedulerStatsHandles,
+    stats: &MultiConnectorStats,
+    generic: &DescriptorDrivenAdapter,
+) {
     for nixl in [&stats.nixl, &stats.nixl_pull, &stats.nixl_push].into_iter().flatten() {
         record_nixl_stats(handles, nixl);
     }
     if let Some(mooncake) = &stats.mooncake {
         record_mooncake_stats(handles, mooncake);
+    }
+    if !stats.other.is_empty() {
+        observe_opaque_connector_stats(
+            generic,
+            &handles.labels.model_name,
+            handles.labels.engine,
+            &stats.other,
+        );
     }
 }
 
@@ -505,6 +546,9 @@ mod tests {
     fn kv_connector_stats_are_recorded_into_mooncake_and_nixl_metrics() {
         let metrics = Metrics::new();
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = crate::connector_metrics::DescriptorDrivenAdapter::empty(Box::leak(
+            Box::new(Metrics::new()),
+        ));
 
         let stats = SchedulerStats {
             kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
@@ -515,7 +559,7 @@ mod tests {
             ..Default::default()
         };
 
-        super::record_scheduler_stats_with_handles(&handles, &stats);
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
 
         let rendered = metrics.render().unwrap();
         assert!(rendered.contains(
@@ -539,5 +583,296 @@ mod tests {
             rendered
                 .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 2")
         );
+    }
+
+    /// Third-party flat stats: first tick carries ``_metrics_descriptor``, later data-only.
+    #[test]
+    fn payload_metrics_descriptor_registers_once_then_data_only() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+        use crate::connector_metrics::descriptor::METRICS_DESCRIPTOR_KEY;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
+
+        let descriptor_json = serde_json::json!({
+            "descriptor_version": 1,
+            "connector_id": "FakeConnector",
+            "metrics": [
+                {
+                    "name": "fake_puts",
+                    "type": "counter",
+                    "documentation": "Fake put attempts",
+                    "samples_path": "put_total",
+                    "sample_kind": "inc_by_u64"
+                },
+                {
+                    "name": "fake_latency_seconds",
+                    "type": "histogram",
+                    "documentation": "Fake latency",
+                    "buckets": [0.001, 0.01, 0.1, 1.0],
+                    "samples_path": "latency_us",
+                    "sample_kind": "observe_each_u64_as_f64",
+                    "scale": 1e-6
+                }
+            ]
+        });
+        let descriptor_value: Value =
+            rmpv::ext::to_value(&descriptor_json).expect("descriptor to msgpack value");
+
+        let mut first = BTreeMap::new();
+        first.insert(METRICS_DESCRIPTOR_KEY.to_string(), descriptor_value);
+        first.insert("put_total".to_string(), Value::from(3u64));
+        first.insert(
+            "latency_us".to_string(),
+            Value::Array(vec![Value::from(1000u64), Value::from(2000u64)]),
+        );
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(first)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains("fake_puts_total{engine=\"0\",model_name=\"model\"} 3"),
+            "missing counter after descriptor tick:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("fake_latency_seconds_count{engine=\"0\",model_name=\"model\"} 2"),
+            "missing histogram after descriptor tick:\n{rendered}"
+        );
+        assert_eq!(generic.registered_ids(), vec!["FakeConnector".to_string()]);
+
+        // Second tick: data only — binds via sole registered descriptor.
+        let mut second = BTreeMap::new();
+        second.insert("put_total".to_string(), Value::from(4u64));
+        let stats2 = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(second)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats2, &generic);
+        let rendered2 = metrics.render().unwrap();
+        assert!(
+            rendered2.contains("fake_puts_total{engine=\"0\",model_name=\"model\"} 7"),
+            "data-only tick should continue observing:\n{rendered2}"
+        );
+    }
+
+    /// Offloading `types`+`data` payload with empty-tuple map keys via payload descriptor.
+    #[test]
+    fn descriptor_driven_offloading_label_tuple_payload_is_recorded() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+        use crate::connector_metrics::descriptor::METRICS_DESCRIPTOR_KEY;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
+
+        let descriptor_json = serde_json::json!({
+            "descriptor_version": 1,
+            "connector_id": "OffloadingConnector",
+            "metrics": [
+                {
+                    "name": "vllm:kv_offload_load_bytes",
+                    "type": "counter",
+                    "samples_path": "data.vllm:kv_offload_load_bytes",
+                    "sample_kind": "inc_by_u64"
+                },
+                {
+                    "name": "vllm:kv_offload_load_time",
+                    "type": "counter",
+                    "samples_path": "data.vllm:kv_offload_load_time",
+                    "sample_kind": "inc_by_f64"
+                },
+                {
+                    "name": "vllm:kv_offload_cpu_cache_usage_perc",
+                    "type": "gauge",
+                    "samples_path": "data.vllm:kv_offload_cpu_cache_usage_perc",
+                    "sample_kind": "set_f64"
+                },
+                {
+                    "name": "vllm:kv_offload_load_size",
+                    "type": "histogram",
+                    "buckets": [1e6, 5e6, 10e6],
+                    "samples_path": "data.vllm:kv_offload_load_size",
+                    "sample_kind": "observe_each_f64"
+                }
+            ]
+        });
+        let descriptor_value: Value =
+            rmpv::ext::to_value(&descriptor_json).expect("descriptor to msgpack value");
+
+        let empty_tuple = Value::Array(vec![]);
+        let data_map = vec![
+            (
+                Value::String("vllm:kv_offload_load_bytes".into()),
+                Value::Map(vec![(empty_tuple.clone(), Value::from(100u64))]),
+            ),
+            (
+                Value::String("vllm:kv_offload_load_time".into()),
+                Value::Map(vec![(empty_tuple.clone(), Value::F64(1.5))]),
+            ),
+            (
+                Value::String("vllm:kv_offload_cpu_cache_usage_perc".into()),
+                Value::Map(vec![(empty_tuple.clone(), Value::F64(0.25))]),
+            ),
+            (
+                Value::String("vllm:kv_offload_load_size".into()),
+                Value::Map(vec![(
+                    empty_tuple,
+                    Value::Array(vec![Value::F64(1e6), Value::F64(2e6)]),
+                )]),
+            ),
+        ];
+        let mut other = BTreeMap::new();
+        other.insert(METRICS_DESCRIPTOR_KEY.to_string(), descriptor_value);
+        other.insert("types".to_string(), Value::Map(vec![]));
+        other.insert("data".to_string(), Value::Map(data_map));
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(other)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_load_bytes_total{engine=\"0\",model_name=\"model\"} 100"
+            ),
+            "missing load_bytes in:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"model\"} 1.5"),
+            "missing load_time in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_cpu_cache_usage_perc{engine=\"0\",model_name=\"model\"} 0.25"
+            ),
+            "missing gauge in:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("vllm:kv_offload_load_size_count{engine=\"0\",model_name=\"model\"} 2"),
+            "missing histogram in:\n{rendered}"
+        );
+    }
+
+    /// Multi.other: class-name key + child ``_metrics_descriptor``.
+    #[test]
+    fn descriptor_driven_multi_nested_child_with_payload_descriptor() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+        use crate::connector_metrics::descriptor::METRICS_DESCRIPTOR_KEY;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
+
+        let offload_descriptor = serde_json::json!({
+            "descriptor_version": 1,
+            "connector_id": "OffloadingConnector",
+            "metrics": [{
+                "name": "vllm:kv_offload_store_bytes",
+                "type": "counter",
+                "samples_path": "data.vllm:kv_offload_store_bytes",
+                "sample_kind": "inc_by_u64"
+            }]
+        });
+        let redhare_descriptor = serde_json::json!({
+            "descriptor_version": 1,
+            "connector_id": "RedhareConnector",
+            "metrics": [{
+                "name": "redhare_put",
+                "type": "counter",
+                "samples_path": "put_total",
+                "sample_kind": "inc_by_u64"
+            }]
+        });
+
+        let empty_tuple = Value::Array(vec![]);
+        let offload_payload = Value::Map(vec![
+            (
+                Value::String(METRICS_DESCRIPTOR_KEY.into()),
+                rmpv::ext::to_value(&offload_descriptor).unwrap(),
+            ),
+            (Value::String("types".into()), Value::Map(vec![])),
+            (
+                Value::String("data".into()),
+                Value::Map(vec![(
+                    Value::String("vllm:kv_offload_store_bytes".into()),
+                    Value::Map(vec![(empty_tuple, Value::from(42u64))]),
+                )]),
+            ),
+        ]);
+        let redhare_payload = Value::Map(vec![
+            (
+                Value::String(METRICS_DESCRIPTOR_KEY.into()),
+                rmpv::ext::to_value(&redhare_descriptor).unwrap(),
+            ),
+            (Value::String("put_total".into()), Value::from(7u64)),
+        ]);
+
+        let mut other = BTreeMap::new();
+        other.insert("OffloadingConnector".to_string(), offload_payload);
+        other.insert("RedhareConnector".to_string(), redhare_payload);
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
+                other,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains(
+                "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"model\"} 42"
+            ),
+            "missing nested offload in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("redhare_put_total{engine=\"0\",model_name=\"model\"} 7"),
+            "missing nested redhare in:\n{rendered}"
+        );
+    }
+
+    /// Flat external stats without ``_metrics_descriptor`` are dropped.
+    #[test]
+    fn flat_connector_without_payload_descriptor_is_not_recorded() {
+        use rmpv::Value;
+
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
+
+        let mut other = BTreeMap::new();
+        other.insert("put_total".to_string(), Value::from(5u64));
+        other.insert("bytes_put".to_string(), Value::from(100u64));
+
+        let stats = SchedulerStats {
+            kv_connector_stats: Some(KvConnectorStats::Other(other)),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats, &generic);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            !rendered.contains("put_total{"),
+            "unregistered flat fields must not become Prom series:\n{rendered}"
+        );
+        assert!(generic.registered_ids().is_empty());
     }
 }
