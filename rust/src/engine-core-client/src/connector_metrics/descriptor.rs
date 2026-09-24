@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// Wire / config schema version supported by this frontend.
-pub(crate) const SCHEMA_VERSION_V1: u32 = 1;
+/// Wire / config descriptor version supported by this frontend.
+pub(crate) const DESCRIPTOR_VERSION_V1: u32 = 1;
 
-/// Reserved stats key carrying a lazy metrics schema (stripped before observe).
-pub(crate) const METRICS_SCHEMA_KEY: &str = "_metrics_schema";
+/// Reserved stats key carrying a lazy metrics descriptor (stripped before observe).
+pub(crate) const METRICS_DESCRIPTOR_KEY: &str = "_metrics_descriptor";
 
 /// How to map one payload field into a Prometheus observation.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub(crate) enum SampleKind {
     ObserveEachU64AsF64,
 }
 
-/// Prometheus metric type declared in the schema.
+/// Prometheus metric type declared in the descriptor.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MetricType {
@@ -58,20 +58,20 @@ fn default_scale() -> f64 {
     1.0
 }
 
-/// Schema v1 document for one connector class name.
+/// Descriptor v1 document for one connector class name.
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct MetricsSchemaV1 {
-    pub schema_version: u32,
+pub(crate) struct MetricsDescriptorV1 {
+    pub descriptor_version: u32,
     pub connector_id: String,
     pub metrics: Vec<MetricDef>,
 }
 
-impl MetricsSchemaV1 {
+impl MetricsDescriptorV1 {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SCHEMA_VERSION_V1 {
+        if self.descriptor_version != DESCRIPTOR_VERSION_V1 {
             return Err(format!(
-                "unsupported schema_version {} (want {SCHEMA_VERSION_V1})",
-                self.schema_version
+                "unsupported descriptor_version {} (want {DESCRIPTOR_VERSION_V1})",
+                self.descriptor_version
             ));
         }
         if self.connector_id.is_empty() {

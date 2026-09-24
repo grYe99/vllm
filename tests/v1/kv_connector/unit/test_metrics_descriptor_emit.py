@@ -1,29 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for Rust-frontend-gated ``_metrics_schema`` emission."""
+"""Unit tests for Rust-frontend-gated ``_metrics_descriptor`` emission."""
 
 from vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector import (
     HF3FSKVConnectorStats,
-    build_hf3fs_metrics_schema,
+    build_hf3fs_metrics_descriptor,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.stats import (
     _HISPARSE_COUNTERS,
     HiSparseKVConnectorStats,
-    build_hisparse_metrics_schema,
+    build_hisparse_metrics_descriptor,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema import (
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics_descriptor import (
     INC_BY_F64,
     INC_BY_SUM_U64,
     INC_BY_U64,
-    METRICS_SCHEMA_KEY,
+    METRICS_DESCRIPTOR_KEY,
     OBSERVE_EACH_F64,
     SET_F64,
-    reset_metrics_schema_emission_for_tests,
+    reset_metrics_descriptor_emission_for_tests,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _FLOAT_COUNTER_NAMES,
     OffloadingConnectorStats,
-    build_offloading_metrics_schema,
+    build_offloading_metrics_descriptor,
     get_connector_metric_definitions,
 )
 from vllm.v1.kv_offload.base import (
@@ -34,69 +34,69 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 
-def test_metrics_schema_not_emitted_for_python_frontend(monkeypatch):
-    reset_metrics_schema_emission_for_tests()
+def test_metrics_descriptor_not_emitted_for_python_frontend(monkeypatch):
+    reset_metrics_descriptor_emission_for_tests()
     monkeypatch.setattr(
-        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema.envs."
+        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_descriptor.envs."
         "VLLM_USE_RUST_FRONTEND",
         False,
     )
     stats = OffloadingConnectorStats()
     stats.increase_counter("vllm:kv_offload_store_bytes", 1)
     payload = stats.to_dict()
-    assert METRICS_SCHEMA_KEY not in payload
+    assert METRICS_DESCRIPTOR_KEY not in payload
     assert "data" in payload
 
 
-def test_metrics_schema_emitted_once_for_rust_frontend(monkeypatch):
-    reset_metrics_schema_emission_for_tests()
+def test_metrics_descriptor_emitted_once_for_rust_frontend(monkeypatch):
+    reset_metrics_descriptor_emission_for_tests()
     monkeypatch.setattr(
-        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema.envs."
+        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_descriptor.envs."
         "VLLM_USE_RUST_FRONTEND",
         True,
     )
     stats = OffloadingConnectorStats()
     stats.increase_counter("vllm:kv_offload_store_bytes", 1)
     first = stats.to_dict()
-    assert METRICS_SCHEMA_KEY in first
-    schema = first[METRICS_SCHEMA_KEY]
-    assert schema["connector_id"] == "OffloadingConnector"
-    assert schema["schema_version"] == 1
-    assert isinstance(schema["metrics"], list)
-    assert len(schema["metrics"]) > 0
+    assert METRICS_DESCRIPTOR_KEY in first
+    descriptor = first[METRICS_DESCRIPTOR_KEY]
+    assert descriptor["connector_id"] == "OffloadingConnector"
+    assert descriptor["descriptor_version"] == 1
+    assert isinstance(descriptor["metrics"], list)
+    assert len(descriptor["metrics"]) > 0
 
     second = stats.to_dict()
-    assert METRICS_SCHEMA_KEY not in second
+    assert METRICS_DESCRIPTOR_KEY not in second
     assert second["data"]["vllm:kv_offload_store_bytes"][()] == 1
 
 
-def test_hisparse_zero_snapshot_emits_metrics_schema_once(monkeypatch):
-    """Empty/zero HiSparse snapshot still carries schema under Rust frontend."""
-    reset_metrics_schema_emission_for_tests()
+def test_hisparse_zero_snapshot_emits_metrics_descriptor_once(monkeypatch):
+    """Empty/zero HiSparse snapshot still carries descriptor under Rust frontend."""
+    reset_metrics_descriptor_emission_for_tests()
     monkeypatch.setattr(
-        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema.envs."
+        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_descriptor.envs."
         "VLLM_USE_RUST_FRONTEND",
         True,
     )
     stats = HiSparseKVConnectorStats()
     stats.record_snapshot(0, 0, 0)
     first = stats.to_dict()
-    assert METRICS_SCHEMA_KEY in first
-    assert first[METRICS_SCHEMA_KEY]["connector_id"] == "HiSparseConnector"
+    assert METRICS_DESCRIPTOR_KEY in first
+    assert first[METRICS_DESCRIPTOR_KEY]["connector_id"] == "HiSparseConnector"
     assert first["cache_hits"] == [0]
 
     second = stats.to_dict()
-    assert METRICS_SCHEMA_KEY not in second
+    assert METRICS_DESCRIPTOR_KEY not in second
     assert second["cache_hits"] == [0]
 
 
-def test_offloading_metrics_schema_derived_from_metadata():
-    """Schema names/kinds match OffloadingMetricMetadata (no JSON file)."""
-    schema = build_offloading_metrics_schema()
-    assert schema["schema_version"] == 1
-    assert schema["connector_id"] == "OffloadingConnector"
+def test_offloading_metrics_descriptor_derived_from_metadata():
+    """Descriptor names/kinds match OffloadingMetricMetadata (no JSON file)."""
+    descriptor = build_offloading_metrics_descriptor()
+    assert descriptor["descriptor_version"] == 1
+    assert descriptor["connector_id"] == "OffloadingConnector"
 
-    by_name = {m["name"]: m for m in schema["metrics"]}
+    by_name = {m["name"]: m for m in descriptor["metrics"]}
     expected = {
         **CPUOffloadingSpec.build_metric_definitions({"store_threshold": 2}),
         **get_connector_metric_definitions(),
@@ -121,11 +121,11 @@ def test_offloading_metrics_schema_derived_from_metadata():
             raise AssertionError(f"unexpected metadata: {metadata}")
 
 
-def test_hf3fs_metrics_schema_matches_prom_names():
-    """Schema names/kinds/buckets match HF3FSPromMetrics (no JSON / table)."""
-    schema = build_hf3fs_metrics_schema()
-    assert schema["connector_id"] == "HF3FSKVConnector"
-    by_name = {m["name"]: m for m in schema["metrics"]}
+def test_hf3fs_metrics_descriptor_matches_prom_names():
+    """Descriptor names/kinds/buckets match HF3FSPromMetrics (no JSON / table)."""
+    descriptor = build_hf3fs_metrics_descriptor()
+    assert descriptor["connector_id"] == "HF3FSKVConnector"
+    by_name = {m["name"]: m for m in descriptor["metrics"]}
     assert set(by_name) == {
         "vllm:hf3fs_save_duration_seconds",
         "vllm:hf3fs_load_duration_seconds",
@@ -165,13 +165,13 @@ def test_hf3fs_metrics_schema_matches_prom_names():
         assert entry["sample_kind"] == INC_BY_U64
 
 
-def test_hisparse_metrics_schema_derived_from_counters():
+def test_hisparse_metrics_descriptor_derived_from_counters():
     """Schema matches ``_HISPARSE_COUNTERS`` used by Prom (no JSON file)."""
-    schema = build_hisparse_metrics_schema()
-    assert schema["connector_id"] == "HiSparseConnector"
-    assert len(schema["metrics"]) == len(_HISPARSE_COUNTERS)
+    descriptor = build_hisparse_metrics_descriptor()
+    assert descriptor["connector_id"] == "HiSparseConnector"
+    assert len(descriptor["metrics"]) == len(_HISPARSE_COUNTERS)
     for entry, (wire_key, documentation) in zip(
-        schema["metrics"], _HISPARSE_COUNTERS, strict=True
+        descriptor["metrics"], _HISPARSE_COUNTERS, strict=True
     ):
         assert entry["name"] == f"vllm:hisparse_{wire_key}"
         assert entry["type"] == "counter"
@@ -180,17 +180,17 @@ def test_hisparse_metrics_schema_derived_from_counters():
         assert entry["documentation"] == documentation
 
 
-def test_hf3fs_emits_derived_schema_once(monkeypatch):
-    reset_metrics_schema_emission_for_tests()
+def test_hf3fs_emits_derived_descriptor_once(monkeypatch):
+    reset_metrics_descriptor_emission_for_tests()
     monkeypatch.setattr(
-        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema.envs."
+        "vllm.distributed.kv_transfer.kv_connector.v1.metrics_descriptor.envs."
         "VLLM_USE_RUST_FRONTEND",
         True,
     )
     stats = HF3FSKVConnectorStats()
     stats.record_success_task_duration("Saved", 0.01)
     first = stats.to_dict()
-    assert METRICS_SCHEMA_KEY in first
-    assert first[METRICS_SCHEMA_KEY] == build_hf3fs_metrics_schema()
+    assert METRICS_DESCRIPTOR_KEY in first
+    assert first[METRICS_DESCRIPTOR_KEY] == build_hf3fs_metrics_descriptor()
     second = stats.to_dict()
-    assert METRICS_SCHEMA_KEY not in second
+    assert METRICS_DESCRIPTOR_KEY not in second

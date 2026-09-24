@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use rmpv::Value;
 
-use super::adapter::{SchemaDrivenAdapter, connector_id_from_payload_schema};
-use super::schema::METRICS_SCHEMA_KEY;
+use super::adapter::{DescriptorDrivenAdapter, connector_id_from_payload_descriptor};
+use super::descriptor::METRICS_DESCRIPTOR_KEY;
 
 /// Builtin connector class names claimed by typed adapters (not generic).
 const BUILTIN_CONNECTOR_IDS: &[&str] = &[
@@ -18,7 +18,7 @@ const BUILTIN_CONNECTOR_IDS: &[&str] = &[
 
 /// Observe opaque third-party connector stats (`Multi.other` / `Other`).
 pub(crate) fn observe_opaque_connector_stats(
-    generic: &SchemaDrivenAdapter,
+    generic: &DescriptorDrivenAdapter,
     model_name: &str,
     engine: u32,
     map: &BTreeMap<String, Value>,
@@ -42,8 +42,8 @@ pub(crate) fn observe_opaque_connector_stats(
         return;
     }
 
-    // Flat single-connector payload. Prefer ``_metrics_schema.connector_id``,
-    // else the sole already-registered schema (data-only ticks after one-shot).
+    // Flat single-connector payload. Prefer ``_metrics_descriptor.connector_id``,
+    // else the sole already-registered descriptor (data-only ticks after one-shot).
     let payload = Value::Map(
         map.iter().map(|(k, v)| (Value::String(k.as_str().into()), v.clone())).collect(),
     );
@@ -54,14 +54,14 @@ pub(crate) fn observe_opaque_connector_stats(
 }
 
 fn resolve_flat_connector_id(
-    generic: &SchemaDrivenAdapter,
+    generic: &DescriptorDrivenAdapter,
     map: &BTreeMap<String, Value>,
 ) -> Option<String> {
-    // 1) Payload carries schema → use its connector_id.
-    if map.contains_key(METRICS_SCHEMA_KEY) {
-        return connector_id_from_payload_schema(map);
+    // 1) Payload carries descriptor → use its connector_id.
+    if map.contains_key(METRICS_DESCRIPTOR_KEY) {
+        return connector_id_from_payload_descriptor(map);
     }
-    // 2) Data-only after one-shot: exactly one schema already registered.
+    // 2) Data-only after one-shot: exactly one descriptor already registered.
     let ids = generic.registered_ids();
     if ids.len() == 1 {
         return ids.into_iter().next();

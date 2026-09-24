@@ -12,7 +12,7 @@ use vllm_metrics::{
     SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
-use crate::connector_metrics::{SchemaDrivenAdapter, observe_opaque_connector_stats};
+use crate::connector_metrics::{DescriptorDrivenAdapter, observe_opaque_connector_stats};
 use crate::protocol::stats::{
     KvConnectorStats, MooncakeStats, MultiConnectorStats, NixlStats, SchedulerStats,
 };
@@ -42,8 +42,8 @@ impl IterationMetricHandles {
 /// frontend client.
 pub(crate) struct SchedulerStatsRecorder {
     engines: BTreeMap<u32, SchedulerStatsHandles>,
-    /// Schema-driven recorder for third-party KV connector stats.
-    generic_connector_metrics: SchemaDrivenAdapter,
+    /// Descriptor-driven recorder for third-party KV connector stats.
+    generic_connector_metrics: DescriptorDrivenAdapter,
 }
 
 /// Per-engine cached metric handles used while recording `SchedulerStats`.
@@ -113,7 +113,7 @@ impl SchedulerStatsRecorder {
     }
 
     /// Like [`Self::new`], but allows tests to inject a non-global metrics
-    /// registry for schema-driven connector families.
+    /// registry for descriptor-driven connector families.
     pub(crate) fn new_with_metrics(
         root_metrics: &'static Metrics,
         metrics: &SchedulerMetrics,
@@ -133,7 +133,7 @@ impl SchedulerStatsRecorder {
 
         Self {
             engines,
-            generic_connector_metrics: SchemaDrivenAdapter::new(root_metrics),
+            generic_connector_metrics: DescriptorDrivenAdapter::new(root_metrics),
         }
     }
 
@@ -227,7 +227,7 @@ fn resolve_scheduler_stats_handles(
 fn record_scheduler_stats_with_handles(
     handles: &SchedulerStatsHandles,
     stats: &SchedulerStats,
-    generic: &SchemaDrivenAdapter,
+    generic: &DescriptorDrivenAdapter,
 ) {
     // Scheduler state gauges.
     handles.scheduler_running.set(stats.num_running_reqs);
@@ -312,7 +312,7 @@ fn record_scheduler_stats_with_handles(
 
     // Connector-specific KV transfer stats. A bare connector reports its own
     // flat payload; MultiConnector reports connector class name -> flat child
-    // payload. Unknown / third-party children go through the schema-driven
+    // payload. Unknown / third-party children go through the descriptor-driven
     // generic adapter.
     if let Some(kv_connector_stats) = &stats.kv_connector_stats {
         match kv_connector_stats {
@@ -334,7 +334,7 @@ fn record_scheduler_stats_with_handles(
 fn record_multi_connector_stats(
     handles: &SchedulerStatsHandles,
     stats: &MultiConnectorStats,
-    generic: &SchemaDrivenAdapter,
+    generic: &DescriptorDrivenAdapter,
 ) {
     for nixl in [&stats.nixl, &stats.nixl_pull, &stats.nixl_push].into_iter().flatten() {
         record_nixl_stats(handles, nixl);
@@ -546,9 +546,9 @@ mod tests {
     fn kv_connector_stats_are_recorded_into_mooncake_and_nixl_metrics() {
         let metrics = Metrics::new();
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = crate::connector_metrics::SchemaDrivenAdapter::empty(Box::leak(Box::new(
-            Metrics::new(),
-        )));
+        let generic = crate::connector_metrics::DescriptorDrivenAdapter::empty(Box::leak(
+            Box::new(Metrics::new()),
+        ));
 
         let stats = SchedulerStats {
             kv_connector_stats: Some(KvConnectorStats::Multi(Box::new(MultiConnectorStats {
@@ -585,20 +585,20 @@ mod tests {
         );
     }
 
-    /// Third-party flat stats: first tick carries ``_metrics_schema``, later data-only.
+    /// Third-party flat stats: first tick carries ``_metrics_descriptor``, later data-only.
     #[test]
-    fn payload_metrics_schema_registers_once_then_data_only() {
+    fn payload_metrics_descriptor_registers_once_then_data_only() {
         use rmpv::Value;
 
-        use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::METRICS_SCHEMA_KEY;
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+        use crate::connector_metrics::descriptor::METRICS_DESCRIPTOR_KEY;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::empty(metrics);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
 
-        let schema_json = serde_json::json!({
-            "schema_version": 1,
+        let descriptor_json = serde_json::json!({
+            "descriptor_version": 1,
             "connector_id": "FakeConnector",
             "metrics": [
                 {
@@ -619,11 +619,11 @@ mod tests {
                 }
             ]
         });
-        let schema_value: Value =
-            rmpv::ext::to_value(&schema_json).expect("schema to msgpack value");
+        let descriptor_value: Value =
+            rmpv::ext::to_value(&descriptor_json).expect("descriptor to msgpack value");
 
         let mut first = BTreeMap::new();
-        first.insert(METRICS_SCHEMA_KEY.to_string(), schema_value);
+        first.insert(METRICS_DESCRIPTOR_KEY.to_string(), descriptor_value);
         first.insert("put_total".to_string(), Value::from(3u64));
         first.insert(
             "latency_us".to_string(),
@@ -638,15 +638,15 @@ mod tests {
         let rendered = metrics.render().unwrap();
         assert!(
             rendered.contains("fake_puts_total{engine=\"0\",model_name=\"model\"} 3"),
-            "missing counter after schema tick:\n{rendered}"
+            "missing counter after descriptor tick:\n{rendered}"
         );
         assert!(
             rendered.contains("fake_latency_seconds_count{engine=\"0\",model_name=\"model\"} 2"),
-            "missing histogram after schema tick:\n{rendered}"
+            "missing histogram after descriptor tick:\n{rendered}"
         );
         assert_eq!(generic.registered_ids(), vec!["FakeConnector".to_string()]);
 
-        // Second tick: data only — binds via sole registered schema.
+        // Second tick: data only — binds via sole registered descriptor.
         let mut second = BTreeMap::new();
         second.insert("put_total".to_string(), Value::from(4u64));
         let stats2 = SchedulerStats {
@@ -661,20 +661,20 @@ mod tests {
         );
     }
 
-    /// Offloading `types`+`data` payload with empty-tuple map keys via payload schema.
+    /// Offloading `types`+`data` payload with empty-tuple map keys via payload descriptor.
     #[test]
-    fn schema_driven_offloading_label_tuple_payload_is_recorded() {
+    fn descriptor_driven_offloading_label_tuple_payload_is_recorded() {
         use rmpv::Value;
 
-        use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::METRICS_SCHEMA_KEY;
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+        use crate::connector_metrics::descriptor::METRICS_DESCRIPTOR_KEY;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::empty(metrics);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
 
-        let schema_json = serde_json::json!({
-            "schema_version": 1,
+        let descriptor_json = serde_json::json!({
+            "descriptor_version": 1,
             "connector_id": "OffloadingConnector",
             "metrics": [
                 {
@@ -704,8 +704,8 @@ mod tests {
                 }
             ]
         });
-        let schema_value: Value =
-            rmpv::ext::to_value(&schema_json).expect("schema to msgpack value");
+        let descriptor_value: Value =
+            rmpv::ext::to_value(&descriptor_json).expect("descriptor to msgpack value");
 
         let empty_tuple = Value::Array(vec![]);
         let data_map = vec![
@@ -730,7 +730,7 @@ mod tests {
             ),
         ];
         let mut other = BTreeMap::new();
-        other.insert(METRICS_SCHEMA_KEY.to_string(), schema_value);
+        other.insert(METRICS_DESCRIPTOR_KEY.to_string(), descriptor_value);
         other.insert("types".to_string(), Value::Map(vec![]));
         other.insert("data".to_string(), Value::Map(data_map));
 
@@ -765,20 +765,20 @@ mod tests {
         );
     }
 
-    /// Multi.other: class-name key + child ``_metrics_schema``.
+    /// Multi.other: class-name key + child ``_metrics_descriptor``.
     #[test]
-    fn schema_driven_multi_nested_child_with_payload_schema() {
+    fn descriptor_driven_multi_nested_child_with_payload_descriptor() {
         use rmpv::Value;
 
-        use crate::connector_metrics::SchemaDrivenAdapter;
-        use crate::connector_metrics::schema::METRICS_SCHEMA_KEY;
+        use crate::connector_metrics::DescriptorDrivenAdapter;
+        use crate::connector_metrics::descriptor::METRICS_DESCRIPTOR_KEY;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::empty(metrics);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
 
-        let offload_schema = serde_json::json!({
-            "schema_version": 1,
+        let offload_descriptor = serde_json::json!({
+            "descriptor_version": 1,
             "connector_id": "OffloadingConnector",
             "metrics": [{
                 "name": "vllm:kv_offload_store_bytes",
@@ -787,8 +787,8 @@ mod tests {
                 "sample_kind": "inc_by_u64"
             }]
         });
-        let redhare_schema = serde_json::json!({
-            "schema_version": 1,
+        let redhare_descriptor = serde_json::json!({
+            "descriptor_version": 1,
             "connector_id": "RedhareConnector",
             "metrics": [{
                 "name": "redhare_put",
@@ -801,8 +801,8 @@ mod tests {
         let empty_tuple = Value::Array(vec![]);
         let offload_payload = Value::Map(vec![
             (
-                Value::String(METRICS_SCHEMA_KEY.into()),
-                rmpv::ext::to_value(&offload_schema).unwrap(),
+                Value::String(METRICS_DESCRIPTOR_KEY.into()),
+                rmpv::ext::to_value(&offload_descriptor).unwrap(),
             ),
             (Value::String("types".into()), Value::Map(vec![])),
             (
@@ -815,8 +815,8 @@ mod tests {
         ]);
         let redhare_payload = Value::Map(vec![
             (
-                Value::String(METRICS_SCHEMA_KEY.into()),
-                rmpv::ext::to_value(&redhare_schema).unwrap(),
+                Value::String(METRICS_DESCRIPTOR_KEY.into()),
+                rmpv::ext::to_value(&redhare_descriptor).unwrap(),
             ),
             (Value::String("put_total".into()), Value::from(7u64)),
         ]);
@@ -847,16 +847,16 @@ mod tests {
         );
     }
 
-    /// Flat external stats without ``_metrics_schema`` are dropped.
+    /// Flat external stats without ``_metrics_descriptor`` are dropped.
     #[test]
-    fn flat_connector_without_payload_schema_is_not_recorded() {
+    fn flat_connector_without_payload_descriptor_is_not_recorded() {
         use rmpv::Value;
 
-        use crate::connector_metrics::SchemaDrivenAdapter;
+        use crate::connector_metrics::DescriptorDrivenAdapter;
 
         let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new()));
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
-        let generic = SchemaDrivenAdapter::empty(metrics);
+        let generic = DescriptorDrivenAdapter::empty(metrics);
 
         let mut other = BTreeMap::new();
         other.insert("put_total".to_string(), Value::from(5u64));

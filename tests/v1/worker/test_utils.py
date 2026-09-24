@@ -52,7 +52,7 @@ def _make_hisparse_worker() -> HiSparseConnectorWorker:
     worker._metrics_calls = 0
     worker._metrics_event = MagicMock()
     worker._metrics_pending = False
-    worker._metrics_schema_bootstrapped = False
+    worker._metrics_descriptor_bootstrapped = False
     worker.leader_runtimes = []
     return worker
 
@@ -62,7 +62,7 @@ def test_hisparse_worker_get_kv_connector_stats_reads_completed_snapshot(monkeyp
     worker._metrics_calls = hisparse_worker_module._METRICS_INTERVAL - 1
     worker._metrics_pending = False
     # Skip one-shot zero bootstrap; this test covers the interval path only.
-    worker._metrics_schema_bootstrapped = True
+    worker._metrics_descriptor_bootstrapped = True
     worker._metrics_event = MagicMock()
     worker._metrics_event.query.return_value = True
     compute_stream = MagicMock()
@@ -94,7 +94,7 @@ def test_hisparse_worker_get_kv_connector_stats_reads_completed_snapshot(monkeyp
 
 
 def test_hisparse_worker_bootstraps_zero_snapshot_once(monkeypatch):
-    """First empty poll returns zeros so `_metrics_schema` can register."""
+    """First empty poll returns zeros so `_metrics_descriptor` can register."""
     worker = _make_hisparse_worker()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
@@ -105,7 +105,7 @@ def test_hisparse_worker_bootstraps_zero_snapshot_once(monkeypatch):
         "cache_misses": [0],
         "host_to_device_bytes": [0],
     }
-    assert worker._metrics_schema_bootstrapped
+    assert worker._metrics_descriptor_bootstrapped
 
     assert worker.get_kv_connector_stats() is None
 
@@ -130,7 +130,7 @@ def test_hisparse_worker_empty_pending_emits_zero_once(monkeypatch):
         "host_to_device_bytes": [0],
     }
     assert not worker._metrics_pending
-    assert worker._metrics_schema_bootstrapped
+    assert worker._metrics_descriptor_bootstrapped
 
     worker._metrics_pending = True
     worker._metrics_event.query.return_value = True

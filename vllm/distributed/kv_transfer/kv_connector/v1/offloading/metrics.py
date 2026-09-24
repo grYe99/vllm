@@ -10,15 +10,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics_schema import (
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics_descriptor import (
     INC_BY_F64,
     INC_BY_U64,
     OBSERVE_EACH_F64,
     SET_F64,
-    build_metrics_schema,
-    maybe_attach_metrics_schema,
+    build_metrics_descriptor,
+    maybe_attach_metrics_descriptor,
     metric_def,
-    strip_metrics_schema,
+    strip_metrics_descriptor,
 )
 from vllm.v1.kv_offload.base import (
     OffloadingCounterMetadata,
@@ -169,17 +169,17 @@ def _metric_type_for_offloading(metadata: OffloadingMetricMetadata) -> str:
     raise AssertionError(f"Unknown offloading metric metadata: {metadata}")
 
 
-def build_offloading_metrics_schema() -> dict[str, Any]:
-    """Derive MetricsSchemaV1 from OffloadingMetricMetadata (same as Prom).
+def build_offloading_metrics_descriptor() -> dict[str, Any]:
+    """Derive MetricsDescriptorV1 from OffloadingMetricMetadata (same as Prom).
 
     Uses connector defs plus CPUOffloadingSpec defs (including optional
     ``stores_skipped``). Tiering / other specs may emit additional wire
     metrics that Prom registers at runtime; those are not in this static
-    schema until their metadata is folded into the emit path the same way.
+    descriptor until their metadata is folded into the emit path the same way.
     """
     from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
-    # store_threshold>=2 includes STORES_SKIPPED so the schema covers the
+    # store_threshold>=2 includes STORES_SKIPPED so the descriptor covers the
     # common CPU path without depending on runtime extra_config.
     definitions: dict[str, OffloadingMetricMetadata] = {
         **CPUOffloadingSpec.build_metric_definitions({"store_threshold": 2}),
@@ -200,7 +200,7 @@ def build_offloading_metrics_schema() -> dict[str, Any]:
                 buckets=buckets,
             )
         )
-    return build_metrics_schema("OffloadingConnector", metrics)
+    return build_metrics_descriptor("OffloadingConnector", metrics)
 
 
 _DEPRECATED_TOTAL_BYTES = "vllm:kv_offload_total_bytes"
@@ -264,16 +264,16 @@ class OffloadingConnectorStats(KVConnectorStats):
     """
 
     def __post_init__(self):
-        # Wire may include _metrics_schema; keep it out of the accumulator.
-        self.data = strip_metrics_schema(self.data) or {}
+        # Wire may include _metrics_descriptor; keep it out of the accumulator.
+        self.data = strip_metrics_descriptor(self.data) or {}
         if _StatsKey.DATA not in self.data:
             self.reset()
 
     def to_dict(self) -> dict[str, Any]:
-        return maybe_attach_metrics_schema(
+        return maybe_attach_metrics_descriptor(
             self.data,
             connector_id="OffloadingConnector",
-            schema=build_offloading_metrics_schema(),
+            descriptor=build_offloading_metrics_descriptor(),
         )
 
     def reset(self):

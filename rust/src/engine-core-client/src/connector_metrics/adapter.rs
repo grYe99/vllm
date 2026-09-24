@@ -12,8 +12,9 @@ use vllm_metrics::{
     U64Counter, U64Gauge, connector_metric_labels,
 };
 
-use super::schema::{
-    METRICS_SCHEMA_KEY, MetricDef, MetricType, MetricsSchemaV1, SCHEMA_VERSION_V1, SampleKind,
+use super::descriptor::{
+    DESCRIPTOR_VERSION_V1, METRICS_DESCRIPTOR_KEY, MetricDef, MetricType, MetricsDescriptorV1,
+    SampleKind,
 };
 
 #[derive(Clone)]
@@ -50,30 +51,30 @@ struct BoundMetric {
     family: DynamicFamily,
 }
 
-struct SchemaInstance {
+struct DescriptorInstance {
     metrics: Vec<BoundMetric>,
 }
 
-/// Registers and observes schema-driven connector metrics.
+/// Registers and observes descriptor-driven connector metrics.
 ///
-/// Schemas arrive via the reserved stats key ``_metrics_schema`` (Python
+/// Descriptors arrive via the reserved stats key ``_metrics_descriptor`` (Python
 /// connectors emit it once when the Rust frontend is enabled). There is no
 /// env-path or ``include_str!`` builtin loader.
-pub(crate) struct SchemaDrivenAdapter {
+pub(crate) struct DescriptorDrivenAdapter {
     metrics: &'static Metrics,
-    instances: RwLock<BTreeMap<String, SchemaInstance>>,
+    instances: RwLock<BTreeMap<String, DescriptorInstance>>,
     warned_missing: Mutex<BTreeSet<String>>,
-    warned_bad_schema: Mutex<BTreeSet<String>>,
+    warned_bad_descriptor: Mutex<BTreeSet<String>>,
 }
 
-impl SchemaDrivenAdapter {
-    /// Empty adapter; schemas register lazily from payload ``_metrics_schema``.
+impl DescriptorDrivenAdapter {
+    /// Empty adapter; descriptors register lazily from payload ``_metrics_descriptor``.
     pub(crate) fn new(metrics: &'static Metrics) -> Self {
         Self {
             metrics,
             instances: RwLock::new(BTreeMap::new()),
             warned_missing: Mutex::new(BTreeSet::new()),
-            warned_bad_schema: Mutex::new(BTreeSet::new()),
+            warned_bad_descriptor: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -87,24 +88,24 @@ impl SchemaDrivenAdapter {
         self.instances.read().keys().cloned().collect()
     }
 
-    /// Validate and register one schema document (idempotent per connector_id).
-    pub(crate) fn ensure_registered(&self, schema: MetricsSchemaV1) -> Result<(), String> {
-        schema.validate()?;
+    /// Validate and register one descriptor document (idempotent per connector_id).
+    pub(crate) fn ensure_registered(&self, descriptor: MetricsDescriptorV1) -> Result<(), String> {
+        descriptor.validate()?;
         {
             let instances = self.instances.read();
-            if instances.contains_key(&schema.connector_id) {
+            if instances.contains_key(&descriptor.connector_id) {
                 return Ok(());
             }
         }
-        let instance = self.build_instance(&schema)?;
+        let instance = self.build_instance(&descriptor)?;
         let mut instances = self.instances.write();
-        instances.entry(schema.connector_id).or_insert(instance);
+        instances.entry(descriptor.connector_id).or_insert(instance);
         Ok(())
     }
 
     /// Observe one opaque connector stats object for ``connector_id``.
     ///
-    /// When the payload carries ``_metrics_schema``, that document's
+    /// When the payload carries ``_metrics_descriptor``, that document's
     /// ``connector_id`` is used for registration and for this observe binding
     /// (overrides the caller-supplied id for flat payloads).
     pub(crate) fn observe(
@@ -116,15 +117,15 @@ impl SchemaDrivenAdapter {
     ) {
         let mut payload = payload.clone();
         let mut bound_id = connector_id.to_string();
-        if let Some(schema_value) = map_remove(&mut payload, METRICS_SCHEMA_KEY) {
-            match rmpv_to_schema(&schema_value) {
-                Ok(schema) => {
-                    bound_id = schema.connector_id.clone();
-                    if let Err(err) = self.ensure_registered(schema) {
-                        self.warn_bad_schema(&bound_id, &err);
+        if let Some(descriptor_value) = map_remove(&mut payload, METRICS_DESCRIPTOR_KEY) {
+            match rmpv_to_descriptor(&descriptor_value) {
+                Ok(descriptor) => {
+                    bound_id = descriptor.connector_id.clone();
+                    if let Err(err) = self.ensure_registered(descriptor) {
+                        self.warn_bad_descriptor(&bound_id, &err);
                     }
                 }
-                Err(err) => self.warn_bad_schema(connector_id, &err),
+                Err(err) => self.warn_bad_descriptor(connector_id, &err),
             }
         }
         let _ = map_remove(&mut payload, "_n_steps");
@@ -141,12 +142,15 @@ impl SchemaDrivenAdapter {
         }
     }
 
-    fn build_instance(&self, schema: &MetricsSchemaV1) -> Result<SchemaInstance, String> {
+    fn build_instance(
+        &self,
+        descriptor: &MetricsDescriptorV1,
+    ) -> Result<DescriptorInstance, String> {
         // Multiple MetricDefs may share one Prom name (e.g. path/outcome
         // const_labels). Register each unique name once and reuse the Family.
         let mut families: BTreeMap<String, DynamicFamily> = BTreeMap::new();
-        let mut metrics = Vec::with_capacity(schema.metrics.len());
-        for def in &schema.metrics {
+        let mut metrics = Vec::with_capacity(descriptor.metrics.len());
+        for def in &descriptor.metrics {
             let reg_name = strip_counter_total_suffix(&def.name, &def.metric_type).to_string();
             if !families.contains_key(&reg_name) {
                 let family = self.register_family(def, &reg_name)?;
@@ -158,7 +162,7 @@ impl SchemaDrivenAdapter {
                 family,
             });
         }
-        Ok(SchemaInstance { metrics })
+        Ok(DescriptorInstance { metrics })
     }
 
     fn register_family(&self, def: &MetricDef, name: &str) -> Result<DynamicFamily, String> {
@@ -235,19 +239,19 @@ impl SchemaDrivenAdapter {
         if warned.insert(connector_id.to_string()) {
             warn!(
                 connector_id,
-                "KV connector stats collected but no metrics schema is registered; \
-                 connectors must emit _metrics_schema once in their stats payload"
+                "KV connector stats collected but no metrics descriptor is registered; \
+                 connectors must emit _metrics_descriptor once in their stats payload"
             );
         }
     }
 
-    fn warn_bad_schema(&self, connector_id: &str, err: &str) {
-        let mut warned = self.warned_bad_schema.lock().expect("warn set");
+    fn warn_bad_descriptor(&self, connector_id: &str, err: &str) {
+        let mut warned = self.warned_bad_descriptor.lock().expect("warn set");
         if warned.insert(connector_id.to_string()) {
             warn!(
                 connector_id,
                 error = err,
-                "ignoring invalid KV connector metrics schema"
+                "ignoring invalid KV connector metrics descriptor"
             );
         }
     }
@@ -261,24 +265,27 @@ fn strip_counter_total_suffix<'a>(name: &'a str, metric_type: &MetricType) -> &'
     }
 }
 
-fn rmpv_to_schema(value: &Value) -> Result<MetricsSchemaV1, String> {
-    // Round-trip via JSON so schema parsing stays serde_json-based.
+fn rmpv_to_descriptor(value: &Value) -> Result<MetricsDescriptorV1, String> {
+    // Round-trip via JSON so descriptor parsing stays serde_json-based.
     let json = serde_json::to_value(value).map_err(|err| err.to_string())?;
-    let schema: MetricsSchemaV1 = serde_json::from_value(json).map_err(|err| err.to_string())?;
-    if schema.schema_version != SCHEMA_VERSION_V1 {
+    let descriptor: MetricsDescriptorV1 =
+        serde_json::from_value(json).map_err(|err| err.to_string())?;
+    if descriptor.descriptor_version != DESCRIPTOR_VERSION_V1 {
         return Err(format!(
-            "unsupported schema_version {}",
-            schema.schema_version
+            "unsupported descriptor_version {}",
+            descriptor.descriptor_version
         ));
     }
-    Ok(schema)
+    Ok(descriptor)
 }
 
-/// Parse ``_metrics_schema`` from a flat stats map, if present.
-pub(crate) fn connector_id_from_payload_schema(map: &BTreeMap<String, Value>) -> Option<String> {
-    let value = map.get(METRICS_SCHEMA_KEY)?;
-    match rmpv_to_schema(value) {
-        Ok(schema) => Some(schema.connector_id),
+/// Parse ``_metrics_descriptor`` from a flat stats map, if present.
+pub(crate) fn connector_id_from_payload_descriptor(
+    map: &BTreeMap<String, Value>,
+) -> Option<String> {
+    let value = map.get(METRICS_DESCRIPTOR_KEY)?;
+    match rmpv_to_descriptor(value) {
+        Ok(descriptor) => Some(descriptor.connector_id),
         Err(_) => None,
     }
 }
