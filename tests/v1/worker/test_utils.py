@@ -57,6 +57,7 @@ def _make_hisparse_worker() -> HiSparseConnectorWorker:
     worker._metrics_calls = 0
     worker._metrics_event = MagicMock()
     worker._metrics_pending = False
+    worker._metrics_descriptor_bootstrapped = False
     worker.leader_runtimes = []
     return worker
 
@@ -65,6 +66,8 @@ def test_hisparse_worker_get_kv_connector_stats_reads_completed_snapshot(monkeyp
     worker = _make_hisparse_worker()
     worker._metrics_calls = hisparse_worker_module._METRICS_INTERVAL - 1
     worker._metrics_pending = False
+    # Skip one-shot zero bootstrap; this test covers the interval path only.
+    worker._metrics_descriptor_bootstrapped = True
     worker._metrics_event = MagicMock()
     worker._metrics_event.query.return_value = True
     compute_stream = MagicMock()
@@ -98,6 +101,60 @@ def test_hisparse_worker_get_kv_connector_stats_reads_completed_snapshot(monkeyp
         "host_block_idle_before_evict_seconds": [],
         "host_block_reuse_gap_seconds": [],
     }
+
+
+def test_hisparse_worker_bootstraps_zero_snapshot_once(monkeypatch):
+    """First empty poll returns zeros so `_metrics_descriptor` can register."""
+    worker = _make_hisparse_worker()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    first = worker.get_kv_connector_stats()
+    assert first is not None
+    assert first.data == {
+        "cache_hits": [0],
+        "cache_misses": [0],
+        "host_to_device_bytes": [0],
+        "host_cache_usage_perc": [],
+        "pending_page_transfers": [],
+        "host_block_lifetime_seconds": [],
+        "host_block_idle_before_evict_seconds": [],
+        "host_block_reuse_gap_seconds": [],
+    }
+    assert worker._metrics_descriptor_bootstrapped
+
+    assert worker.get_kv_connector_stats() is None
+
+
+def test_hisparse_worker_empty_pending_emits_zero_once(monkeypatch):
+    """Completed empty GPU snapshot still emits zeros on first bootstrap."""
+    worker = _make_hisparse_worker()
+    worker._metrics_pending = True
+    worker._metrics_event.query.return_value = True
+    group = SimpleNamespace(
+        swap_stats_host=torch.tensor([0, 0], dtype=torch.uint64),
+        stats_row_bytes=16,
+    )
+    worker.leader_runtimes = [SimpleNamespace(index_group=group)]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    stats = worker.get_kv_connector_stats()
+    assert stats is not None
+    assert stats.data == {
+        "cache_hits": [0],
+        "cache_misses": [0],
+        "host_to_device_bytes": [0],
+        "host_cache_usage_perc": [],
+        "pending_page_transfers": [],
+        "host_block_lifetime_seconds": [],
+        "host_block_idle_before_evict_seconds": [],
+        "host_block_reuse_gap_seconds": [],
+    }
+    assert not worker._metrics_pending
+    assert worker._metrics_descriptor_bootstrapped
+
+    worker._metrics_pending = True
+    worker._metrics_event.query.return_value = True
+    assert worker.get_kv_connector_stats() is None
 
 
 def test_hisparse_row_mirrors_follow_runner_request_order():
@@ -239,7 +296,7 @@ def test_hisparse_shares_host_pool_only_for_local_tp(monkeypatch):
 @pytest.mark.skip_global_cleanup
 def test_hisparse_shared_host_pool_uses_one_replicated_mmap(monkeypatch):
     page = mmap.PAGESIZE
-    tp_group = MagicMock()
+    tp_group = MagicMock(rank_in_group=1, world_size=2)
     monkeypatch.setattr(hisparse_runtime_module, "get_tp_group", lambda: tp_group)
 
     class FakeSharedOffloadRegion:
@@ -253,6 +310,7 @@ def test_hisparse_shared_host_pool_uses_one_replicated_mmap(monkeypatch):
             self.pinned_addresses = []
             self.view_sizes = []
             self.offset = 0
+            kwargs["barrier"]()
 
         def create_next_canonical_view(self, size):
             self.view_sizes.append(size)
@@ -280,16 +338,13 @@ def test_hisparse_shared_host_pool_uses_one_replicated_mmap(monkeypatch):
     pinned: list[torch.Tensor] = []
 
     def pin_tensor(tensor):
+        tp_group.barrier.assert_called_once_with()
         pinned.append(tensor)
 
     monkeypatch.setattr(hisparse_runtime_module, "pin_tensor", pin_tensor)
     config = SimpleNamespace(
         instance_id="instance",
-        parallel_config=_hisparse_parallel_config(
-            tensor_parallel_size=1,
-            world_size=1,
-            distributed_executor_backend="uni",
-        ),
+        parallel_config=_hisparse_parallel_config(),
     )
 
     pools, private_pools, region = hisparse_runtime_module.allocate_hisparse_host_pools(
@@ -310,7 +365,7 @@ def test_hisparse_shared_host_pool_uses_one_replicated_mmap(monkeypatch):
         "cpu_page_size": 64,
         "barrier": tp_group.barrier,
         "creator_memory_check": hisparse_runtime_module.check_hisparse_host_memory,
-        "populate_only_on_creator": True,
+        "populate_shard": (1, 2),
     }
     assert region.view_sizes == [24, 40]
     assert [pool.shape for pool in pools] == [(24,), (40,)]
@@ -328,7 +383,8 @@ def test_shared_host_pool_tracks_successful_registrations(
 ):
     """Only successful registrations may be unregistered on allocation failure."""
     page = mmap.PAGESIZE
-    monkeypatch.setattr(hisparse_runtime_module, "get_tp_group", MagicMock())
+    tp_group = MagicMock(rank_in_group=0, world_size=2)
+    monkeypatch.setattr(hisparse_runtime_module, "get_tp_group", lambda: tp_group)
     backing = torch.empty(3 * page, dtype=torch.uint8)
     region = MagicMock(base_tensor=backing, pinned_addresses=[], is_pinned=False)
     monkeypatch.setattr(
