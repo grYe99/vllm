@@ -111,7 +111,37 @@ If you enable prefill instance (`--prefill-servers-urls` not disabled), you will
 | `--decode-servers-urls` | Comma-separated list of decode endpoints. Non-stream and stream paths both round-robin over this list. |
 | `--ec-consumer-zmq-addrs` | Mooncake EC consumer control addresses, aligned with `--decode-servers-urls`. Required for `ECMooncakeConnector`. Supported only in E+PD mode (`--prefill-servers-urls disable`). |
 | `--ec-consumer-dp-size` | Data-parallel replicas per EC consumer (default 1). |
+| `--encoder-dispatch` | When encoder work starts: `e-first` (default) or `p-first` (experimental). See [Encoder dispatch](#encoder-dispatch-e-first-vs-p-first). |
 | `--host`, `--port` | Bind address for the proxy itself (defaults: `0.0.0.0:8000`). |
+
+### Encoder dispatch: e-first vs p-first
+
+By default (`--encoder-dispatch=e-first`) the proxy encodes every multimodal
+item before the request reaches the consumer, which overlaps encoder latency
+with other stages but can redo encoder work the consumer did not need: when a
+conversation turn reuses media whose prefix KV is already cached on the
+P/PD instance, the encoder runs anyway (see
+[vllm#55639](https://github.com/vllm-project/vllm/issues/55639)).
+
+With `--encoder-dispatch=p-first`, the proxy first sends the request to the
+consumer as a *demand probe*: the engine classifies every occurrence
+(prefix-KV covered / reusable on the consumer / needs the encoder) and returns
+the report on the response's `ec_transfer_params` without running the model.
+The proxy then fans out encoder work for the `need_from_e` subset only, and
+forwards items the consumer already covers as raw media (the consumer skips
+re-encoding them via its normal scheduling path).
+
+Correctness notes:
+
+- A probe that fails or returns no report falls back to encoding everything,
+  so p-first degrades to e-first, never to a missing embedding.
+- Items the probe reports as covered are sent as raw media, so a stale report
+  (e.g. the KV was evicted between probe and request) just makes the consumer
+  encode locally — the same path as a monolithic deployment.
+- The report is advisory; the scheduler re-validates on admission.
+- Do not flip the default until the redundant-encode savings are measured
+  against the extra probe round trip on cold requests (open question in
+  vllm#55639).
 
 ### Dynamic registration
 
