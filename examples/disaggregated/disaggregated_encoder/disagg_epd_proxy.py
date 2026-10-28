@@ -319,6 +319,7 @@ class EPDProxyConfig:
     probe_timeout: float = 2.0
     fail_threshold: int = 3
     evicted_ttl: float = 900.0
+    encoder_dispatch: str = "e-first"
 
 
 @dataclass
@@ -449,6 +450,12 @@ if ENCODER_MAX_BATCH_SIZE < 0:
 # the encode again, which produces a fresh transfer.
 DECODE_RETRIES = 1
 
+# When to start encoder work. "e-first" encodes every media item before the
+# request reaches the consumer (the original behavior). "p-first" first asks
+# the consumer which items it still needs encoded, and fans out only those;
+# an unanswerable probe falls back to encoding everything.
+ENCODER_DISPATCH = "e-first"
+
 
 # Grid metadata reported by the encoder instance, keyed by item index.
 # Empty when the encoder did not report any (then nothing is rewritten).
@@ -492,6 +499,7 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, list[dict]]) -> dict
         for i in range(len(mm_items))
     )
     rewritten = 0
+    uuid_attached = False
     transfer_items = []
     idx = 0
     new_messages = []
@@ -528,7 +536,12 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, list[dict]]) -> dict
                 # `--mm-processor-cache-type shm`, where a hit replaces the item
                 # with its shared-memory address and only the worker restores
                 # it. Send the media so the decoder can derive the grid itself.
-                new_content.append(item)
+                # Carry the uuid either way: under p-first dispatch this item
+                # was skipped precisely because the consumer holds its cache
+                # under the uuid key, and a bare item would re-key to a content
+                # hash the consumer has never seen.
+                new_content.append({**item, "uuid": item_uuid})
+                uuid_attached = True
                 continue
             metadata = {
                 feature["modality"] + "_embeds": {
@@ -543,7 +556,10 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, list[dict]]) -> dict
             rewritten += 1
         new_messages.append({**msg, "content": new_content})
 
-    if not rewritten and not raw_audio_request:
+    # `uuid_attached` without `rewritten` is the p-first fully-skipped case:
+    # the uuids must still reach the decoder, or it re-keys the raw items to
+    # content hashes its caches have never seen and defers forever.
+    if not rewritten and not raw_audio_request and not uuid_attached:
         return req_data
     if rewritten:
         logger.info("Rewrote %d media item(s) as metadata references", rewritten)
@@ -578,10 +594,15 @@ async def fanout_encoder_primer(
     e_urls: list[str],
     req_id: str,
     consumer_zmq: str | None = None,
+    item_indices: set[int] | None = None,
 ) -> tuple[dict[int, list[dict]], dict[str, Any]]:
     """1. Group images by encoder, retaining per-item round-robin assignment.
     2. Send them concurrently to the encode cluster.
     3. Raise if any of them fails.
+
+    `item_indices` restricts the fan-out to a subset of the request's media
+    items (p-first dispatch encodes only what the consumer still needs); None
+    encodes everything (e-first).
 
     Returns, per item index, the metadata the encoder reported in
     `ec_transfer_params`: its EC cache key and the grid its processor produced.
@@ -594,12 +615,31 @@ async def fanout_encoder_primer(
     """
     logger.info("[%s] Processing multimodal items...", req_id)
 
-    mm_items = extract_mm_items(orig_request)
-    if not mm_items:
+    all_mm_items = extract_mm_items(orig_request)
+    if not all_mm_items:
         logger.info("[%s] No multimodal items, skipping encoder", req_id)
         return {}, {}  # nothing to do
 
-    logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
+    if item_indices is not None:
+        # Indices are positions in the request's full media list, so
+        # rewrite_for_decode can keep addressing items it did not encode.
+        if not item_indices:
+            logger.info(
+                "[%s] Consumer demand covers all %d items, skipping encoder",
+                req_id,
+                len(all_mm_items),
+            )
+            return {}, {}
+        logger.info(
+            "[%s] P-first dispatch: encoding %d of %d multimodal items",
+            req_id,
+            len(item_indices),
+            len(all_mm_items),
+        )
+    else:
+        logger.info("[%s] got %d multimodal items...", req_id, len(all_mm_items))
+
+    mm_items = all_mm_items
 
     tasks = []
     item_uuids: dict[int, str] = {}
@@ -620,6 +660,8 @@ async def fanout_encoder_primer(
     groups: list[tuple[str, list[int]]] = []
     image_groups: dict[str, list[int]] = {}
     for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
+        if item_indices is not None and idx not in item_indices:
+            continue
         if item["type"] == "image_url":
             indices = image_groups.get(target_url)
             if indices is None or (
@@ -823,6 +865,71 @@ async def fanout_encoder_primer(
     return item_meta, ec_params
 
 
+async def probe_embedding_demand(
+    req_data: dict,
+    req_id: str,
+    consumer_url: str,
+    dp_rank: int | None = None,
+) -> set[int] | None:
+    """Ask the consumer (P/PD) which media items still need encoder work.
+
+    Sends the request as a demand probe: the engine classifies every
+    occurrence (prefix-KV covered / reusable on the consumer / needs the
+    encoder) and returns the report instead of running the model. Returns the
+    indices of the `need_from_e` occurrences, or None when the probe could not
+    be answered -- the caller then falls back to encoding everything, which is
+    correct, just possibly redundant.
+    """
+    probe_body = {
+        **req_data,
+        "stream": False,
+        "max_tokens": 1,
+        "vllm_xargs": {"embedding_demand_probe": True},
+    }
+    # ChatCompletionRequest rejects stream_options when stream is false.
+    probe_body.pop("stream_options", None)
+    headers = {"x-request-id": f"{req_id}:probe", "Content-Type": "application/json"}
+    if dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(dp_rank)
+    try:
+        async with decode_session.post(
+            f"{consumer_url}/v1/chat/completions",
+            data=msgspec.json.encode(probe_body),
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(
+                    "[%s] Demand probe returned status %d; encoding all items",
+                    req_id,
+                    resp.status,
+                )
+                return None
+            body = msgspec.json.decode(await resp.read())
+    except Exception as exc:
+        logger.warning("[%s] Demand probe failed (%s); encoding all items", req_id, exc)
+        return None
+
+    report = (body.get("ec_transfer_params") or {}).get("embedding_demand")
+    if not report or "demands" not in report:
+        # Pre-p-first engine: no report path, so the probe ran a full decode.
+        logger.warning(
+            "[%s] Consumer returned no demand report; encoding all items", req_id
+        )
+        return None
+    need = {
+        entry["index"]
+        for entry in report["demands"]
+        if entry["reason"] == "need_from_e"
+    }
+    logger.info(
+        "[%s] Demand report: %d/%d item(s) still need the encoder",
+        req_id,
+        len(need),
+        len(report["demands"]),
+    )
+    return need
+
+
 async def maybe_prefill(
     req_data: dict,
     p_url: str,
@@ -1004,15 +1111,31 @@ async def prepare_for_decode(
     p_url: str,
     consumer_zmq: str | None,
     prefill_dp_rank: int | None = None,
+    encoder_dispatch: str = "e-first",
+    consumer_url: str | None = None,
+    consumer_dp_rank: int | None = None,
 ) -> tuple[dict, float, float]:
     """Encode, rewrite and prefill, returning the body to send to decode.
 
     `req_data` is left untouched so a retry starts from the original media
     rather than from a body whose images are already metadata references.
+
+    With `encoder_dispatch="p-first"`, the consumer is first probed for which
+    items it still needs encoded, and the encoder fan-out is restricted to
+    those. A probe that cannot be answered falls back to encoding everything.
     """
     _t0 = time.perf_counter()
+    item_indices = None
+    if (
+        encoder_dispatch == "p-first"
+        and consumer_url is not None
+        and extract_mm_items(req_data)
+    ):
+        item_indices = await probe_embedding_demand(
+            req_data, req_id, consumer_url, consumer_dp_rank
+        )
     item_meta, ec_params = await fanout_encoder_primer(
-        req_data, e_urls, req_id, consumer_zmq
+        req_data, e_urls, req_id, consumer_zmq, item_indices
     )
     _t1 = time.perf_counter()
     prepared = req_data if NO_REWRITE else rewrite_for_decode(req_data, item_meta)
@@ -1037,12 +1160,23 @@ async def forward_non_stream(
     consumer_zmq: str | None,
     dp_rank: int | None = None,
     prefill_dp_rank: int | None = None,
+    encoder_dispatch: str = "e-first",
 ) -> Response:
     try:
         for attempt in range(DECODE_RETRIES + 1):
             _t0 = time.perf_counter()
             prepared, encode_s, rewrite_s = await prepare_for_decode(
-                req_data, req_id, e_urls, p_url, consumer_zmq, prefill_dp_rank
+                req_data,
+                req_id,
+                e_urls,
+                p_url,
+                consumer_zmq,
+                prefill_dp_rank,
+                encoder_dispatch,
+                # The demand probe must reach the instance that consumes the
+                # embeddings, which is the prefill half when one is split out.
+                p_url or d_url,
+                prefill_dp_rank if p_url else dp_rank,
             )
             _t2 = time.perf_counter()
 
@@ -1117,12 +1251,21 @@ async def forward_stream(
     consumer_zmq: str | None,
     dp_rank: int | None = None,
     prefill_dp_rank: int | None = None,
+    encoder_dispatch: str = "e-first",
 ) -> AsyncIterator[bytes]:
     try:
         for attempt in range(DECODE_RETRIES + 1):
             _t0 = time.perf_counter()
             prepared, encode_s, rewrite_s = await prepare_for_decode(
-                req_data, req_id, e_urls, p_url, consumer_zmq, prefill_dp_rank
+                req_data,
+                req_id,
+                e_urls,
+                p_url,
+                consumer_zmq,
+                prefill_dp_rank,
+                encoder_dispatch,
+                p_url or d_url,
+                prefill_dp_rank if p_url else dp_rank,
             )
             _t2 = time.perf_counter()
 
@@ -1210,12 +1353,26 @@ async def chat_completions(request: Request):
         if is_streaming:
             return StreamingResponse(
                 forward_stream(
-                    req_data, req_id, e_urls, p_url, d_url, consumer_zmq, dp_rank
+                    req_data,
+                    req_id,
+                    e_urls,
+                    p_url,
+                    d_url,
+                    consumer_zmq,
+                    dp_rank,
+                    encoder_dispatch=ENCODER_DISPATCH,
                 ),
                 media_type="text/event-stream",
             )
         return await forward_non_stream(
-            req_data, req_id, e_urls, p_url, d_url, consumer_zmq, dp_rank
+            req_data,
+            req_id,
+            e_urls,
+            p_url,
+            d_url,
+            consumer_zmq,
+            dp_rank,
+            encoder_dispatch=ENCODER_DISPATCH,
         )
 
     except HTTPException:
@@ -1428,6 +1585,7 @@ def build_app(config: EPDProxyConfig | None = None) -> FastAPI:
         ranks = {
             "dp_rank": route.dp_rank if route.prefill is None else None,
             "prefill_dp_rank": route.dp_rank if route.prefill is not None else None,
+            "encoder_dispatch": config.encoder_dispatch,
         }
         if req_data.get("stream", False):
             return StreamingResponse(
@@ -1562,6 +1720,17 @@ if __name__ == "__main__":
             "encoder push has to land where the request will run."
         ),
     )
+    parser.add_argument(
+        "--encoder-dispatch",
+        choices=["e-first", "p-first"],
+        default="e-first",
+        help=(
+            "When encoder work starts. e-first (default) encodes every media "
+            "item before the consumer sees the request. p-first first probes "
+            "the consumer for the items it still needs and encodes only those; "
+            "a failed probe falls back to encoding everything."
+        ),
+    )
 
     args = parser.parse_args()
     if args.fail_threshold < 1:
@@ -1571,6 +1740,7 @@ if __name__ == "__main__":
         app.middleware("http")(log_requests)
     NO_REWRITE = args.no_rewrite
     DECODE_RETRIES = max(0, args.decode_retries)
+    ENCODER_DISPATCH = args.encoder_dispatch
     if args.dynamic_registration:
         if not os.getenv("ADMIN_API_KEY"):
             parser.error("--dynamic-registration requires ADMIN_API_KEY")
@@ -1589,6 +1759,7 @@ if __name__ == "__main__":
                 probe_timeout=args.probe_timeout,
                 fail_threshold=args.fail_threshold,
                 evicted_ttl=args.evicted_ttl,
+                encoder_dispatch=args.encoder_dispatch,
             )
         )
         if args.log_requests:

@@ -40,6 +40,12 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.embedding_demand import (
+    PrefillEmbeddingDemandReport,
+    _no_external_item,
+    classify_embedding_demand,
+    is_embedding_demand_probe,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -55,7 +61,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -253,6 +264,10 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        # Demand reports for probe requests finished in schedule(), emitted
+        # in update_from_output(). Holds (client_index, payload) pairs; the
+        # request itself is already freed by then.
+        self._embedding_demand_reports: dict[str, tuple[int, dict[str, Any]]] = {}
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -1064,6 +1079,19 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if is_embedding_demand_probe(request.sampling_params):
+                    # P-first demand probe: answer with a report and finish,
+                    # without scheduling or running the model. The report is
+                    # emitted by update_from_output on the EC transfer channel.
+                    report = self.embedding_demand_report(request, 0)
+                    if report is not None:
+                        self._embedding_demand_reports[request_id] = (
+                            request.client_index,
+                            report.to_dict(),
+                        )
+                    self.finish_requests(request_id, RequestStatus.FINISHED_STOPPED)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1990,6 +2018,34 @@ class Scheduler(SchedulerInterface):
         for input_id in duplicate_input_ids:
             self.encoder_cache_manager.check_and_update_cache(request, input_id)
 
+    def embedding_demand_report(
+        self, request: Request, num_computed_tokens: int = 0
+    ) -> PrefillEmbeddingDemandReport | None:
+        """Classify the request's occurrences for an EPD orchestrator.
+
+        Pure query: no cache or connector state is mutated, so the caller can
+        run it before admission (e.g. to answer a proxy's demand probe). The
+        classification mirrors `_try_schedule_encoder_inputs`: occurrences
+        whose token range is already covered by computed KV are never
+        scheduled, and the rest are served from the local encoder cache or the
+        EC connector before falling back to needing the encoder.
+        """
+        if not request.has_encoder_inputs:
+            return None
+        return classify_embedding_demand(
+            request.request_id,
+            request.mm_features,
+            num_computed_tokens=num_computed_tokens,
+            num_tokens=request.num_tokens,
+            is_encoder_decoder=self.is_encoder_decoder,
+            cached_num_embeds=self.encoder_cache_manager.get_cached_num_encoder_embeds_by_hash,
+            has_external_item=(
+                self.ec_connector.has_cache_item
+                if self.ec_connector is not None
+                else _no_external_item
+            ),
+        )
+
     def _try_schedule_encoder_inputs(
         self,
         request: Request,
@@ -2261,6 +2317,21 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+
+        # Demand probes finished by schedule() in this step: emit the report
+        # on the EC transfer channel, which already reaches the response body.
+        if self._embedding_demand_reports:
+            for req_id, report in self._embedding_demand_reports.items():
+                client_index, payload = report
+                outputs[client_index].append(
+                    EngineCoreOutput(
+                        request_id=req_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.STOP,
+                        ec_transfer_params={"embedding_demand": payload},
+                    )
+                )
+            self._embedding_demand_reports = {}
 
         failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
