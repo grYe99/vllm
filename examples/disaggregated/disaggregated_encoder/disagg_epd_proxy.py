@@ -877,6 +877,8 @@ async def probe_embedding_demand(
         "max_tokens": 1,
         "vllm_xargs": {"embedding_demand_probe": True},
     }
+    # ChatCompletionRequest rejects stream_options when stream is false.
+    probe_body.pop("stream_options", None)
     headers = {"x-request-id": f"{req_id}:probe", "Content-Type": "application/json"}
     if dp_rank is not None:
         headers["X-data-parallel-rank"] = str(dp_rank)
