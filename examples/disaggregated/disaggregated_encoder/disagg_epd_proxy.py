@@ -499,6 +499,7 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, list[dict]]) -> dict
         for i in range(len(mm_items))
     )
     rewritten = 0
+    uuid_attached = False
     transfer_items = []
     idx = 0
     new_messages = []
@@ -535,7 +536,12 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, list[dict]]) -> dict
                 # `--mm-processor-cache-type shm`, where a hit replaces the item
                 # with its shared-memory address and only the worker restores
                 # it. Send the media so the decoder can derive the grid itself.
-                new_content.append(item)
+                # Carry the uuid either way: under p-first dispatch this item
+                # was skipped precisely because the consumer holds its cache
+                # under the uuid key, and a bare item would re-key to a content
+                # hash the consumer has never seen.
+                new_content.append({**item, "uuid": item_uuid})
+                uuid_attached = True
                 continue
             metadata = {
                 feature["modality"] + "_embeds": {
@@ -550,7 +556,10 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, list[dict]]) -> dict
             rewritten += 1
         new_messages.append({**msg, "content": new_content})
 
-    if not rewritten and not raw_audio_request:
+    # `uuid_attached` without `rewritten` is the p-first fully-skipped case:
+    # the uuids must still reach the decoder, or it re-keys the raw items to
+    # content hashes its caches have never seen and defers forever.
+    if not rewritten and not raw_audio_request and not uuid_attached:
         return req_data
     if rewritten:
         logger.info("Rewrote %d media item(s) as metadata references", rewritten)
