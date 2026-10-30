@@ -2033,6 +2033,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 with self.ec_connector.maybe_get_output(
                     scheduler_output
                 ) as ec_connector_output:
+                    # Experimental (VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER=1):
+                    # start the engram lookup before the encoder runs, on the
+                    # models whose state opts in; no-op otherwise.
+                    self.model_state.maybe_prefetch_engram_before_encoder(
+                        scheduler_output,
+                        input_batch,
+                        self.req_states,
+                        attn_metadata,
+                        dp_sync_state,
+                        batch_desc,
+                    )
                     inputs_embeds = self.model_state.prepare_inputs_embeds(
                         scheduled_encoder_inputs, input_batch, self.req_states
                     )

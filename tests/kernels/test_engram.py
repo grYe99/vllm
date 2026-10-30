@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
@@ -967,6 +968,239 @@ def test_engram_prefetch_detects_missing_dependency(monkeypatch, missing_depende
             _run_engram_prepared_rows(True, "eager", delay=delay)
     finally:
         torch.accelerator.synchronize()
+
+
+def _fake_vllm_config():
+    """A VllmConfig stand-in with the fields set_forward_context reads."""
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+            use_sequence_parallel_moe=False,
+            is_moe_model=True,
+        ),
+        compilation_config=SimpleNamespace(
+            fast_moe_cold_start=False,
+            static_forward_context={},
+            static_all_moe_layers=[],
+        ),
+    )
+
+
+def _overlap_scaffold_model():
+    """A DeepseekV4Model with just the engram-entry fields, plus call spies.
+
+    `prepare_engram_embeddings`'s hash stage is replaced with a stub here (the
+    hash kernel itself is covered by the tests above); what these exercise is
+    the once-per-step launch contract between the pre-encoder hook and the LM
+    forward entry.
+    """
+    from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
+
+    model = DeepseekV4Model.__new__(DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model._early_engram_embeddings = None
+    model.engram_hash = SimpleNamespace(lookback_depth=3, ensure_cache=lambda: True)
+    model.engram_swa_prefix = "swa"
+    model.engram_batch = None
+    model.engram_dp_shared_memory = False
+
+    class CountingEngram:
+        def __init__(self):
+            self.prepare_calls: list[torch.Tensor] = []
+
+        def prepare_embeddings(self, hashes):
+            self.prepare_calls.append(hashes)
+
+    engrams = [CountingEngram(), None, CountingEngram()]
+    model.layers = [
+        SimpleNamespace(layer_hash_index=i, engram=e) for i, e in enumerate(engrams)
+    ]
+    model.start_layer, model.end_layer = 0, 3
+
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+
+    def fake_prepare(input_ids, positions, lookback_token_ids):
+        calls.append((input_ids, positions, lookback_token_ids))
+        hashes = torch.zeros(
+            (input_ids.shape[0], 2, 24), dtype=torch.int32, device=input_ids.device
+        )
+        return hashes, torch.ones(input_ids.shape[0], dtype=torch.bool)
+
+    model.prepare_engram_embeddings = fake_prepare  # type: ignore[method-assign]
+    return model, engrams, calls
+
+
+def _lm_entry_engram_block(model, input_ids, positions, lookback):
+    """The LM forward entry's engram branch shape: adopt or launch."""
+
+    def entry():
+        with set_forward_context(
+            {}, _fake_vllm_config(), num_tokens=input_ids.shape[0]
+        ):
+            early = model._take_early_engram_embeddings()
+            hashes, mask = (
+                early
+                if early is not None
+                else model.prepare_engram_embeddings(input_ids, positions, lookback)
+            )
+            return hashes, mask
+
+    return entry
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("graph_mode_entry", [False, True])
+def test_early_engram_prepare_adopted_exactly_once(graph_mode_entry):
+    """Early prepare once -> eager LM entry adopts it and launches nothing."""
+    from vllm.config import CUDAGraphMode
+
+    model, engrams, calls = _overlap_scaffold_model()
+    ids = torch.zeros(5, dtype=torch.int64, device="cuda")
+    positions = torch.arange(5, device="cuda")
+    lookback = torch.full((1, 3), -1, dtype=torch.int32, device="cuda")
+
+    with set_forward_context(
+        {},
+        _fake_vllm_config(),
+        num_tokens=ids.shape[0],
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    ):
+        early_hashes, early_mask = model.prepare_engram_embeddings(
+            ids, positions, lookback
+        )
+        model._store_early_engram_embeddings(early_hashes, early_mask)
+
+    if graph_mode_entry:
+        # Defensive path: a stored pair must never be adopted by a graph-mode
+        # entry; the entry launches its own prepare instead.
+        def entry():
+            with set_forward_context(
+                {},
+                _fake_vllm_config(),
+                num_tokens=ids.shape[0],
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ):
+                early = model._take_early_engram_embeddings()
+                assert early is None
+                return model.prepare_engram_embeddings(ids, positions, lookback)
+
+    else:
+        entry = _lm_entry_engram_block(model, ids, positions, lookback)
+
+    hashes, mask = entry()
+    if graph_mode_entry:
+        assert len(calls) == 2
+    else:
+        # Eager step: the entry adopts the pre-encoder pair and launches
+        # nothing itself.
+        assert len(calls) == 1, "entry must not launch a second prepare"
+        assert hashes is early_hashes and mask is early_mask
+    # Consume-once: a second entry (which must not happen within a step, but a
+    # stale store must not survive one) launches its own prepare.
+    hashes2, _ = entry()
+    assert hashes2 is not early_hashes
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_text_step_prepares_at_lm_entry_only():
+    """No early store (text / encode-skipped) -> entry owns the prepare."""
+    model, engrams, calls = _overlap_scaffold_model()
+    ids = torch.zeros(3, dtype=torch.int64, device="cuda")
+    positions = torch.arange(3, device="cuda")
+    entry = _lm_entry_engram_block(model, ids, positions, None)
+
+    hashes, mask = entry()
+
+    assert len(calls) == 1, "entry must run exactly one prepare"
+    assert hashes.shape == (3, 2, 24) and mask.shape == (3,)
+
+
+def _hook_state(model, *, encoder_kwargs=None):
+    """A DeepseekV41ModelState with just the pre-encoder hook's fields."""
+    from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.engram_model = model
+    state.lookback_token_ids = None
+    state.vllm_config = _fake_vllm_config()
+    state.vllm_config.lora_config = None
+    state.encoder_runner = SimpleNamespace(
+        prepare_mm_inputs=lambda scheduled: ([], encoder_kwargs)
+    )
+    return state
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_prefetch_before_encoder_hook_gates(monkeypatch):
+    """The hook launches only for eager MM steps with private tables."""
+    import vllm.envs as envs
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v41.nvidia import model_state
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    def scheduled(n):
+        output = SchedulerOutput.make_empty()
+        output.scheduled_encoder_inputs = {"req": list(range(n))}
+        return output
+
+    eager = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=1
+    )
+    piecewise = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=4, num_reqs=1
+    )
+    attn = {"swa": object()}
+    ids = torch.zeros(4, dtype=torch.int64, device="cuda")
+    positions = torch.arange(4, device="cuda")
+    monkeypatch.setattr(model_state, "get_engram_dp_size", lambda: 1, raising=True)
+
+    def run(flag, encoder_items, desc, metadata, dp_size=1, stale=False):
+        model, _, calls = _overlap_scaffold_model()
+        if stale:
+            model._early_engram_embeddings = (
+                torch.zeros(1, 2, 24, dtype=torch.int32, device="cuda"),
+                None,
+            )
+        state = _hook_state(model, encoder_kwargs=[("image", object())] * encoder_items)
+        monkeypatch.setattr(envs, "VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER", flag)
+        monkeypatch.setattr(model_state, "get_engram_dp_size", lambda: dp_size)
+        state.maybe_prefetch_engram_before_encoder(
+            scheduled(1) if encoder_items else SchedulerOutput.make_empty(),
+            SimpleNamespace(
+                input_ids=ids,
+                positions=positions,
+                num_tokens_after_padding=ids.shape[0],
+            ),
+            None,
+            metadata,
+            None,
+            desc,
+        )
+        return model, calls
+
+    # Flag off: nothing launches, nothing stored.
+    model, calls = run(False, 1, eager, attn)
+    assert len(calls) == 0 and model._early_engram_embeddings is None
+    # Eager MM step: one launch, stored for the entry to adopt.
+    model, calls = run(True, 1, eager, attn)
+    assert len(calls) == 1 and model._early_engram_embeddings is not None
+    # Encoder-cache hit (no items to encode): entry keeps owning the prepare.
+    model, calls = run(True, 0, eager, attn)
+    assert len(calls) == 0 and model._early_engram_embeddings is None
+    # A stale store is dropped even on a step that launches nothing.
+    model, calls = run(True, 0, eager, attn, stale=True)
+    assert len(calls) == 0 and model._early_engram_embeddings is None
+    # Graph-mode steps never launch early.
+    model, calls = run(True, 1, piecewise, attn)
+    assert len(calls) == 0 and model._early_engram_embeddings is None
+    # DBO (list attention metadata) never launches early.
+    model, calls = run(True, 1, eager, [attn])
+    assert len(calls) == 0 and model._early_engram_embeddings is None
+    # DP-sharded engram tables never launch early.
+    model, calls = run(True, 1, eager, attn, dp_size=2)
+    assert len(calls) == 0 and model._early_engram_embeddings is None
 
 
 def _run_engram_prepared_rows(

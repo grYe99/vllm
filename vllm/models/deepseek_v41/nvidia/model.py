@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_engram_dp_size,
@@ -910,6 +910,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory
         )
         self.engram_swa_prefix: str | None = None
+        # Set by the model runner's pre-encoder engram hook (eager MM steps
+        # with VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER=1) and consumed by the LM
+        # forward entry, so hash+prepare launches exactly once per step.
+        self._early_engram_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
         if self.engram_layout is not None:
             engram = next(
                 (
@@ -977,6 +981,100 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             }
         )
 
+    def prepare_engram_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        lookback_token_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hash the batch's token ids and stage every engram layer's rows.
+
+        Must run inside a forward context with SWA attention metadata: at the
+        LM forward entry as before, or — with
+        VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER=1 — from the model runner just
+        before it submits the multimodal GPU encoder. Returns the hashes and
+        the keep-mask the engram layers consume.
+        """
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, list):
+            attn_metadata = attn_metadata[dbo_current_ubatch_id()]
+        assert isinstance(attn_metadata, dict)
+        assert self.engram_hash is not None and self.engram_swa_prefix is not None
+        swa_metadata = typing.cast(
+            "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
+        )
+        # Image-span tokens are dead: they break n-grams (hash op
+        # takes True=dead) and their gate is zeroed (Engram.forward
+        # takes True=keep).
+        image_mask = image_sentinel_mask(input_ids)
+        engram_mask = ~image_mask
+        if lookback_token_ids is None:
+            if not self.engram_hash.use_slot_cache:
+                raise NotImplementedError(
+                    "engram needs `lookback_token_ids` from the model "
+                    "runner (the DBO/ubatch wrapper drops model kwargs)"
+                )
+            num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
+            lookback_token_ids = input_ids.new_full(
+                (num_reqs, self.engram_hash.lookback_depth), -1
+            )
+        engram_hashes = self.engram_hash(
+            input_ids,
+            positions,
+            swa_metadata.query_start_loc,
+            image_mask,
+            lookback_token_ids,
+            image_sentinel_mask(lookback_token_ids),
+            swa_metadata.slot_mapping,
+            swa_metadata.block_table,
+        )
+        # Gather all Engram rows before entering the decoder layers.
+        # One gather feeds every layer sharing the DP-split table.
+        if self.engram_batch is not None:
+            self.engram_batch.prepare_embeddings(engram_hashes)
+        else:
+            gathered_hashes = gather_engram_hashes(
+                engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+            )
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.prepare_embeddings(
+                        gathered_hashes[:, engram.layer_hash_index]
+                    )
+        return engram_hashes, engram_mask
+
+    def _store_early_engram_embeddings(
+        self, engram_hashes: torch.Tensor, engram_mask: torch.Tensor
+    ) -> None:
+        """Record the pre-encoder hash+prepare for the LM entry to adopt.
+
+        The model runner calls this only on eager (cg_mode=NONE) steps of the
+        first PP rank, so graph capture and replay never observe a set value.
+        """
+        self._early_engram_embeddings = (engram_hashes, engram_mask)
+
+    def _take_early_engram_embeddings(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Adopt a pre-encoder prepare, if one was stored for this step.
+
+        Consumes the stored pair; a stale one (e.g. left by a failed step) is
+        dropped. Only eager steps adopt: cudagraph replays re-execute only the
+        segments captured while the store was empty, so their entry prepare is
+        baked into the captured sequence and must not be skipped.
+        """
+        stored = self._early_engram_embeddings
+        self._early_engram_embeddings = None
+        if stored is None:
+            return None
+        if (
+            not is_forward_context_available()
+            or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE
+        ):
+            return None
+        return stored
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1001,7 +1099,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Engram n-gram hashes for the whole (flattened) batch, computed once
         # on the full token stream — before any sequence-parallel sharding —
         # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
+        # profile runs (KV cache unbound). With
+        # VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER=1 on an eager multimodal step,
+        # the model runner already launched hash+prepare before the GPU
+        # encoder; `_take_early_engram_embeddings` then returns them here so
+        # the launch happens exactly once per step.
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if (
@@ -1013,54 +1115,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if isinstance(attn_metadata, list):
                 attn_metadata = attn_metadata[dbo_current_ubatch_id()]
             if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
-                assert self.engram_swa_prefix is not None
-                swa_metadata = typing.cast(
-                    "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
-                )
-                # Image-span tokens are dead: they break n-grams (hash op
-                # takes True=dead) and their gate is zeroed (Engram.forward
-                # takes True=keep).
-                image_mask = image_sentinel_mask(input_ids)
-                engram_mask = ~image_mask
-                if lookback_token_ids is None:
-                    if not self.engram_hash.use_slot_cache:
-                        raise NotImplementedError(
-                            "engram needs `lookback_token_ids` from the model "
-                            "runner (the DBO/ubatch wrapper drops model kwargs)"
-                        )
-                    num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
-                    lookback_token_ids = input_ids.new_full(
-                        (num_reqs, self.engram_hash.lookback_depth), -1
+                early = self._take_early_engram_embeddings()
+                engram_hashes, engram_mask = (
+                    early
+                    if early is not None
+                    else self.prepare_engram_embeddings(
+                        input_ids, positions, lookback_token_ids
                     )
-                engram_hashes = self.engram_hash(
-                    input_ids,
-                    positions,
-                    swa_metadata.query_start_loc,
-                    image_mask,
-                    lookback_token_ids,
-                    image_sentinel_mask(lookback_token_ids),
-                    swa_metadata.slot_mapping,
-                    swa_metadata.block_table,
                 )
             elif not self.engram_dp_shared_memory and get_engram_dp_size() > 1:
                 # DP-sharded lookups are collective, so a replica skipping the
                 # hash still has to reach them.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
-            if engram_hashes is not None:
-                # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
-                if self.engram_batch is not None:
-                    self.engram_batch.prepare_embeddings(engram_hashes)
-                else:
-                    gathered_hashes = gather_engram_hashes(
-                        engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
-                    )
-                    for layer in islice(self.layers, self.start_layer, self.end_layer):
-                        engram = getattr(layer, "engram", None)
-                        if engram is not None:
-                            engram.prepare_embeddings(
-                                gathered_hashes[:, engram.layer_hash_index]
-                            )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:

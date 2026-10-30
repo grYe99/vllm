@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,10 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 
 class ModelSpecificAttnMetadata:
@@ -187,6 +191,30 @@ class ModelState(ABC):
     def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor | None:
         """Pre-allocated inputs_embeds buffer for dummy runs (contents unused)."""
         return None
+
+    def maybe_prefetch_engram_before_encoder(
+        self,
+        scheduler_output: "SchedulerOutput",
+        input_batch: "InputBatch",
+        req_states: "RequestState",
+        attn_metadata: Any,
+        dp_sync_state: Any,
+        batch_desc: "BatchExecutionDescriptor",
+    ) -> None:
+        """Hook before the multimodal encoder runs on this step.
+
+        Default no-op; models with n-gram lookup layers override it to start
+        their table reads before the encoder submits (opt-in via
+        VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER=1).
+        """
+        del (
+            scheduler_output,
+            input_batch,
+            req_states,
+            attn_metadata,
+            dp_sync_state,
+            batch_desc,
+        )
 
     def execute_mm_encoder(
         self, scheduled_encoder_inputs: dict[str, list[int]]
