@@ -117,8 +117,8 @@ long-term home for the flag (env var vs `EngramConfig` field vs engine arg),
 - Qwen4Exp PLE layers share `EngramConfig` plumbing but a different n-gram
   module; this feature is DeepSeek-V4.1-only as implemented (the hook checks
   the model's `engram_hash`).
-- No @mentions by policy; reviewers will be subscribed via the normal
-  CODEOWNERS flow.
+- Reviewers are subscribed via the normal CODEOWNERS flow; this document
+  deliberately names no individual accounts.
 
 ## CC List
 
