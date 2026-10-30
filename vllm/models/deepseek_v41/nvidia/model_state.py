@@ -8,10 +8,17 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.distributed import get_engram_dp_size
 from vllm.distributed.parallel_state import get_dp_group, get_pcp_group, get_pp_group
-from vllm.forward_context import BatchDescriptor, DPMetadata, create_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    DPMetadata,
+    create_forward_context,
+    set_forward_context,
+)
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
     ReplayBatch,
@@ -22,7 +29,7 @@ from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -209,6 +216,13 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids = torch.full(
                 (max_local_reqs, depth), -1, dtype=torch.int32, device=device
             )
+        # The nn.Module owning the engram entry block: the text model inside
+        # the vision-language wrapper, or the model itself for text-only.
+        self.engram_model = (
+            model.language_model.model
+            if hasattr(model, "language_model")
+            else model.model
+        )
 
         # Per request state index; batches gather from it (see prepare_attn).
         self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
@@ -291,13 +305,12 @@ class DeepseekV41ModelState(DefaultModelState):
                 )
             ) or self.vllm_config.aux_output_config.enable_return_routed_experts
 
-    def prepare_inputs(
+    def _gather_lookback(
         self, input_batch: InputBatch, req_states: RequestState
-    ) -> dict[str, torch.Tensor | None]:
-        model_inputs = super().prepare_inputs(input_batch, req_states)
+    ) -> torch.Tensor:
+        """Fill the persistent lookback window from device token history."""
         window = self.lookback_token_ids
-        if window is None:
-            return model_inputs
+        assert window is not None
         all_token_ids = req_states.all_token_ids.gpu
         depth = window.shape[1]
         _gather_lookback_kernel[(window.shape[0],)](
@@ -311,8 +324,93 @@ class DeepseekV41ModelState(DefaultModelState):
             DEPTH=depth,
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
-        model_inputs["lookback_token_ids"] = window
+        return window
+
+    def prepare_inputs(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> dict[str, torch.Tensor | None]:
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if self.lookback_token_ids is None:
+            return model_inputs
+        model_inputs["lookback_token_ids"] = self._gather_lookback(
+            input_batch, req_states
+        )
         return model_inputs
+
+    def maybe_prefetch_engram_before_encoder(
+        self,
+        scheduler_output: "SchedulerOutput",
+        input_batch: InputBatch,
+        req_states: RequestState,
+        attn_metadata: Any,
+        dp_sync_state: Any,
+        batch_desc: BatchExecutionDescriptor,
+    ) -> None:
+        """Launch the engram hash+lookup just before the GPU encoder runs.
+
+        With VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER=1, an eager step that will
+        run the multimodal encoder starts the engram lookup first, so the
+        (side-stream, host-offloaded) table reads overlap the ViT forward
+        instead of running after it. The LM forward entry then adopts the
+        stored hashes and skips its own prepare, so the launch happens
+        exactly once per step (C1 of the overlap design).
+
+        Deliberately narrow: private per-replica tables only (an engram DP
+        group would make the prepare collective and ranks could disagree on
+        whether an encoder runs), eager steps only (cudagraph replays bake in
+        the entry prepare), first PP rank only (the only rank that encodes).
+        """
+        inner = self.engram_model
+        # Unconditional: a pair left by a step that died between launch and
+        # forward must never be adopted by this step's LM entry.
+        inner._early_engram_embeddings = None
+        if (
+            not envs.VLLM_ENGRAM_PREFETCH_BEFORE_ENCODER
+            or not isinstance(attn_metadata, dict)
+            # DBO runs one LM entry per ubatch; a single early prepare cannot
+            # stand in for them.
+            or not scheduler_output.scheduled_encoder_inputs
+            or batch_desc.cg_mode != CUDAGraphMode.NONE
+            or inner.engram_hash is None
+            or get_engram_dp_size() > 1
+        ):
+            return
+        assert self.encoder_runner is not None
+        mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
+            scheduler_output.scheduled_encoder_inputs
+        )
+        del mm_hashes
+        if not mm_kwargs:
+            # Encoder-cache hits and passthrough embeds: no GPU encode, so
+            # the LM entry keeps owning the prepare.
+            return
+        if not inner.engram_hash.ensure_cache():
+            # Same guard as the LM entry; profile runs skip the hash.
+            return
+        lookback = None
+        if self.lookback_token_ids is not None:
+            lookback = self._gather_lookback(input_batch, req_states)
+            # shortcut: prepare_inputs re-gathers the same window later in the
+            # step; harmless duplicate launch, revisit if MM prefill profiling
+            # ever flags it.
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=input_batch.num_tokens_after_padding,
+            num_tokens_across_dp=(
+                dp_sync_state.num_tokens_across_dp if dp_sync_state else None
+            ),
+            cudagraph_runtime_mode=batch_desc.cg_mode,
+            batch_descriptor=BatchDescriptor(
+                num_tokens=input_batch.num_tokens_after_padding,
+                has_lora=self.vllm_config.lora_config is not None,
+                num_active_loras=batch_desc.num_active_loras,
+            ),
+        ):
+            hashes, mask = inner.prepare_engram_embeddings(
+                input_batch.input_ids, input_batch.positions, lookback
+            )
+        inner._store_early_engram_embeddings(hashes, mask)
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
