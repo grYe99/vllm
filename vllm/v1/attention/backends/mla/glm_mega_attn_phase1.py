@@ -16,6 +16,12 @@ around the existing sparse MLA kernel into CUDA-graph-friendly custom ops,
 gated by ``VLLM_GLM_MEGA_ATTN_PHASE1`` (default off). Fail closed unless the
 device is exactly SM90.
 
+Hot-path alloc hygiene: callers that already hold a
+``current_workspace_manager`` Q buffer (``q_concat_buffer`` in
+``FlashMLASparseImpl.forward_mqa``) should pass it as ``out=`` so the fused
+kernels write in-place. Allocating via ``new_empty`` is only a fallback for
+tests / paths without a reserved workspace.
+
 Phase-2 (indexer / top-k fusion) is intentionally deferred.
 """
 
@@ -85,12 +91,13 @@ def prepare_q_nope_fp8_decode_ref(
     pad_q_heads: int,
     q_head_size: int,
     kv_lora_rank: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference: pack ``[T, H, kv_lora]`` into ``[T, pad_H, q_head_size]``.
 
     Copies real heads into ``[:num_q_heads, :kv_lora_rank]`` and zero-fills the
     RoPE slot plus any padded head rows. Matches the historical FlashMLA sparse
-    FP8 NoPE decode layout.
+    FP8 NoPE decode layout. When ``out`` is provided, writes into it in-place.
     """
     assert ql_nope.dim() == 3
     tokens = ql_nope.shape[0]
@@ -98,7 +105,11 @@ def prepare_q_nope_fp8_decode_ref(
     assert ql_nope.shape[2] == kv_lora_rank
     assert pad_q_heads >= num_q_heads
     assert q_head_size >= kv_lora_rank
-    q = ql_nope.new_empty((tokens, pad_q_heads, q_head_size))
+    if out is None:
+        q = ql_nope.new_empty((tokens, pad_q_heads, q_head_size))
+    else:
+        assert out.shape == (tokens, pad_q_heads, q_head_size)
+        q = out
     q.zero_()
     q[:, :num_q_heads, :kv_lora_rank].copy_(ql_nope)
     return q
@@ -107,34 +118,57 @@ def prepare_q_nope_fp8_decode_ref(
 def layout_attn_out_for_uv_ref(
     attn_out: torch.Tensor,
     num_q_heads: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference: unpad heads and materialize contiguous ``[T, H, D]`` for W_UV."""
     assert attn_out.dim() == 3
-    out = attn_out[:, :num_q_heads, :]
-    if not out.is_contiguous():
-        out = out.contiguous()
+    tokens, _, head_size = attn_out.shape
+    sliced = attn_out[:, :num_q_heads, :]
+    if out is None:
+        if sliced.is_contiguous():
+            return sliced
+        return sliced.contiguous()
+    assert out.shape == (tokens, num_q_heads, head_size)
+    out.copy_(sliced)
     return out
 
 
 def pad_q_heads_ref(
     q: torch.Tensor,
     pad_q_heads: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference: pad ``[N, H, D]`` (or ``[B, S, H, D]``) heads to ``pad_q_heads``."""
     if q.dim() == 4:
         b, s, h, d = q.shape
         if h == pad_q_heads:
-            return q
-        out = q.new_zeros((b, s, pad_q_heads, d))
-        out[:, :, :h, :].copy_(q)
-        return out
+            if out is None:
+                return q
+            out.copy_(q)
+            return out
+        if out is None:
+            dest = q.new_zeros((b, s, pad_q_heads, d))
+        else:
+            assert out.shape == (b, s, pad_q_heads, d)
+            dest = out
+            dest.zero_()
+        dest[:, :, :h, :].copy_(q)
+        return dest
     assert q.dim() == 3
     n, h, d = q.shape
     if h == pad_q_heads:
-        return q
-    out = q.new_zeros((n, pad_q_heads, d))
-    out[:, :h, :].copy_(q)
-    return out
+        if out is None:
+            return q
+        out.copy_(q)
+        return out
+    if out is None:
+        dest = q.new_zeros((n, pad_q_heads, d))
+    else:
+        assert out.shape == (n, pad_q_heads, d)
+        dest = out
+        dest.zero_()
+    dest[:, :h, :].copy_(q)
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -256,22 +290,30 @@ def _fuse_prepare_q_nope_fp8_decode_impl(
     pad_q_heads: int,
     q_head_size: int,
     kv_lora_rank: int,
-) -> torch.Tensor:
+    out: torch.Tensor,
+) -> None:
+    """Write packed NoPE Q into ``out`` (mutates). No per-call alloc."""
     tokens = ql_nope.shape[0]
-    q = ql_nope.new_empty((tokens, pad_q_heads, q_head_size))
+    assert out.shape == (tokens, pad_q_heads, q_head_size)
     if tokens == 0 or pad_q_heads == 0:
-        return q
+        return
 
     if (not ql_nope.is_cuda) or (not HAS_TRITON):
-        return prepare_q_nope_fp8_decode_ref(
-            ql_nope, num_q_heads, pad_q_heads, q_head_size, kv_lora_rank
+        prepare_q_nope_fp8_decode_ref(
+            ql_nope,
+            num_q_heads,
+            pad_q_heads,
+            q_head_size,
+            kv_lora_rank,
+            out=out,
         )
+        return
 
     block_d = _next_pow2_ge(q_head_size)
     grid = (tokens * pad_q_heads,)
     _fuse_prepare_q_nope_fp8_kernel[grid](
         ql_nope,
-        q,
+        out,
         tokens,
         num_q_heads,
         pad_q_heads,
@@ -280,30 +322,33 @@ def _fuse_prepare_q_nope_fp8_decode_impl(
         ql_nope.stride(0),
         ql_nope.stride(1),
         ql_nope.stride(2),
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
         BLOCK_D=block_d,
     )
-    return q
 
 
 def _fuse_pad_q_heads_impl(
     q: torch.Tensor,
     pad_q_heads: int,
-) -> torch.Tensor:
-    """Pad last-head dim of a 3D ``[N, H, D]`` tensor. Callers flatten 4D."""
+    out: torch.Tensor,
+) -> None:
+    """Pad last-head dim of a 3D ``[N, H, D]`` tensor into ``out`` (mutates)."""
     assert q.dim() == 3
     rows, num_q_heads, head_size = q.shape
+    assert out.shape == (rows, pad_q_heads, head_size)
     if num_q_heads == pad_q_heads:
-        return q
+        if out.data_ptr() != q.data_ptr():
+            out.copy_(q)
+        return
     if rows == 0:
-        return q.new_empty((0, pad_q_heads, head_size))
+        return
 
     if (not q.is_cuda) or (not HAS_TRITON):
-        return pad_q_heads_ref(q, pad_q_heads)
+        pad_q_heads_ref(q, pad_q_heads, out=out)
+        return
 
-    out = q.new_empty((rows, pad_q_heads, head_size))
     block_d = _next_pow2_ge(head_size)
     grid = (rows * pad_q_heads,)
     _fuse_pad_q_heads_kernel[grid](
@@ -321,24 +366,30 @@ def _fuse_pad_q_heads_impl(
         out.stride(2),
         BLOCK_D=block_d,
     )
-    return out
 
 
 def _fuse_layout_attn_out_for_uv_impl(
     attn_out: torch.Tensor,
     num_q_heads: int,
-) -> torch.Tensor:
+    out: torch.Tensor,
+) -> None:
+    """Unpad / layout attention out into contiguous ``out`` (mutates)."""
     tokens, pad_q_heads, head_size = attn_out.shape
+    assert out.shape == (tokens, num_q_heads, head_size)
     if tokens == 0 or num_q_heads == 0:
-        return attn_out.new_empty((tokens, num_q_heads, head_size))
+        return
 
-    if pad_q_heads == num_q_heads and attn_out.is_contiguous():
-        return attn_out
+    if (
+        pad_q_heads == num_q_heads
+        and attn_out.is_contiguous()
+        and out.data_ptr() == attn_out.data_ptr()
+    ):
+        return
 
     if (not attn_out.is_cuda) or (not HAS_TRITON):
-        return layout_attn_out_for_uv_ref(attn_out, num_q_heads)
+        layout_attn_out_for_uv_ref(attn_out, num_q_heads, out=out)
+        return
 
-    out = attn_out.new_empty((tokens, num_q_heads, head_size))
     block_d = _next_pow2_ge(head_size)
     grid = (tokens * num_q_heads,)
     _fuse_layout_attn_out_kernel[grid](
@@ -356,7 +407,6 @@ def _fuse_layout_attn_out_for_uv_impl(
         out.stride(2),
         BLOCK_D=block_d,
     )
-    return out
 
 
 def _fuse_prepare_q_nope_fp8_decode_fake(
@@ -365,43 +415,45 @@ def _fuse_prepare_q_nope_fp8_decode_fake(
     pad_q_heads: int,
     q_head_size: int,
     kv_lora_rank: int,
-) -> torch.Tensor:
-    return ql_nope.new_empty((ql_nope.shape[0], pad_q_heads, q_head_size))
+    out: torch.Tensor,
+) -> None:
+    return None
 
 
 def _fuse_pad_q_heads_fake(
     q: torch.Tensor,
     pad_q_heads: int,
-) -> torch.Tensor:
-    return q.new_empty((q.shape[0], pad_q_heads, q.shape[2]))
+    out: torch.Tensor,
+) -> None:
+    return None
 
 
 def _fuse_layout_attn_out_for_uv_fake(
     attn_out: torch.Tensor,
     num_q_heads: int,
-) -> torch.Tensor:
-    tokens, _, head_size = attn_out.shape
-    return attn_out.new_empty((tokens, num_q_heads, head_size))
+    out: torch.Tensor,
+) -> None:
+    return None
 
 
 direct_register_custom_op(
     op_name="glm_mega_attn_phase1_prepare_q",
     op_func=_fuse_prepare_q_nope_fp8_decode_impl,
-    mutates_args=[],
+    mutates_args=["out"],
     fake_impl=_fuse_prepare_q_nope_fp8_decode_fake,
 )
 
 direct_register_custom_op(
     op_name="glm_mega_attn_phase1_pad_q_heads",
     op_func=_fuse_pad_q_heads_impl,
-    mutates_args=[],
+    mutates_args=["out"],
     fake_impl=_fuse_pad_q_heads_fake,
 )
 
 direct_register_custom_op(
     op_name="glm_mega_attn_phase1_layout_out",
     op_func=_fuse_layout_attn_out_for_uv_impl,
-    mutates_args=[],
+    mutates_args=["out"],
     fake_impl=_fuse_layout_attn_out_for_uv_fake,
 )
 
@@ -423,38 +475,82 @@ def fuse_prepare_q_nope_fp8_decode(
     pad_q_heads: int,
     q_head_size: int,
     kv_lora_rank: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fused NoPE Q pack + head pad for FP8 sparse MLA decode (custom op)."""
-    return _prepare_q_op(ql_nope, num_q_heads, pad_q_heads, q_head_size, kv_lora_rank)
+    """Fused NoPE Q pack + head pad for FP8 sparse MLA decode (custom op).
+
+    Prefer passing a preallocated ``out`` from ``current_workspace_manager`` /
+    ``q_concat_buffer`` so CUDA-graph / eager decode does not allocate scratch
+    each step. When ``out`` is omitted, allocates a fresh buffer (tests only).
+    """
+    if out is None:
+        out = ql_nope.new_empty((ql_nope.shape[0], pad_q_heads, q_head_size))
+    _prepare_q_op(ql_nope, num_q_heads, pad_q_heads, q_head_size, kv_lora_rank, out)
+    return out
 
 
-def fuse_pad_q_heads(q: torch.Tensor, pad_q_heads: int) -> torch.Tensor:
+def fuse_pad_q_heads(
+    q: torch.Tensor,
+    pad_q_heads: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Fused head pad for FP8 sparse MLA decode.
 
     Accepts ``[N, H, D]`` or ``[B, S, H, D]``; returns the same rank.
+    Pass ``out`` to avoid a per-call alloc when a workspace buffer is available.
     """
     if q.dim() == 4:
         b, s, h, d = q.shape
         if h == pad_q_heads:
-            return q
+            if out is None:
+                return q
+            out.copy_(q)
+            return out
         flat = q.reshape(b * s, h, d)
-        padded = _pad_q_heads_op(flat, pad_q_heads)
+        if out is None:
+            padded = flat.new_empty((b * s, pad_q_heads, d))
+        else:
+            assert out.shape == (b, s, pad_q_heads, d)
+            padded = out.reshape(b * s, pad_q_heads, d)
+        _pad_q_heads_op(flat, pad_q_heads, padded)
         return padded.view(b, s, pad_q_heads, d)
-    return _pad_q_heads_op(q, pad_q_heads)
+    rows, h, d = q.shape
+    if h == pad_q_heads:
+        if out is None:
+            return q
+        out.copy_(q)
+        return out
+    if out is None:
+        out = q.new_empty((rows, pad_q_heads, d))
+    _pad_q_heads_op(q, pad_q_heads, out)
+    return out
 
 
 def fuse_layout_attn_out_for_uv(
     attn_out: torch.Tensor,
     num_q_heads: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused attention-out unpad/layout for W_UV absorb (custom op).
 
     Accepts ``[N, pad_H, D]`` or ``[B, S, pad_H, D]``; returns the same rank
-    with ``num_q_heads`` and contiguous storage.
+    with ``num_q_heads`` and contiguous storage. Pass ``out`` to reuse a
+    preallocated workspace buffer.
     """
     if attn_out.dim() == 4:
         b, s, h, d = attn_out.shape
         flat = attn_out.reshape(b * s, h, d)
-        out = _layout_out_op(flat, num_q_heads)
-        return out.view(b, s, num_q_heads, d)
-    return _layout_out_op(attn_out, num_q_heads)
+        if out is None:
+            dest = flat.new_empty((b * s, num_q_heads, d))
+        else:
+            assert out.shape == (b, s, num_q_heads, d)
+            dest = out.reshape(b * s, num_q_heads, d)
+        _layout_out_op(flat, num_q_heads, dest)
+        return dest.view(b, s, num_q_heads, d)
+    tokens, _, head_size = attn_out.shape
+    if out is None and attn_out.shape[1] == num_q_heads and attn_out.is_contiguous():
+        return attn_out
+    if out is None:
+        out = attn_out.new_empty((tokens, num_q_heads, head_size))
+    _layout_out_op(attn_out, num_q_heads, out)
+    return out

@@ -52,6 +52,15 @@ True single-kernel MegaAttention needs new SM90 kernels (out of scope). Phase-1
 is the smallest change that removes real Python/CUDA launches on the GLM decode
 hot path and stays CUDA-graph friendly via registered custom ops.
 
+## Workspace reuse (alloc hygiene)
+
+`forward_mqa` already reserves a `q_concat` buffer via
+`current_workspace_manager`. Phase-1 fused Q-prep **writes into that buffer**
+(`out=`) instead of calling `new_empty` every decode step. Pad / out-layout
+ops similarly accept an optional `out=` and reuse the reserved FP8 workspace
+slots when shapes match. FlashMLA sparse (`flash_mla_with_kvcache`) is
+unchanged.
+
 ## Code map
 
 - `vllm/envs.py` — `VLLM_GLM_MEGA_ATTN_PHASE1`

@@ -1341,7 +1341,19 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 f"{padded_num_heads} for FP8 sparse decode kernel"
             )
             if use_phase1:
-                q = fuse_pad_q_heads(q, padded_num_heads)
+                # Reuse q_concat workspace capacity when the 4D query can be
+                # reshaped onto the reserved [T, pad_H, D] buffer; otherwise
+                # allocate once via the fuse fallback.
+                b, s, h, d = q.shape
+                q_concat_buffer, *_ = current_workspace_manager().get_simultaneous(
+                    *self.workspace_specs
+                )
+                flat_out = q_concat_buffer[: b * s, :padded_num_heads, :d]
+                if flat_out.shape == (b * s, padded_num_heads, d):
+                    q_out = flat_out.view(b, s, padded_num_heads, d)
+                    q = fuse_pad_q_heads(q, padded_num_heads, out=q_out)
+                else:
+                    q = fuse_pad_q_heads(q, padded_num_heads)
             else:
                 q_padded = q.new_zeros(
                     (q.size(0), q.size(1), padded_num_heads, q.size(3))
@@ -1367,7 +1379,21 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Slice output and lse back to actual head count if we padded
         if out.size(2) > actual_num_heads:
             if use_phase1:
-                out = fuse_layout_attn_out_for_uv(out, actual_num_heads)
+                # Prefer the reserved compact_out workspace (last FP8 spec)
+                # so unpad/layout does not allocate every decode step.
+                *_, compact_out = current_workspace_manager().get_simultaneous(
+                    *self.workspace_specs
+                )
+                b, s, _, d = out.shape
+                need = (b * s, actual_num_heads, d)
+                heads_ok = compact_out.shape[1:] == need[1:]
+                if compact_out.shape[0] >= need[0] and heads_ok:
+                    layout_out = compact_out[: b * s].view(b, s, actual_num_heads, d)
+                    out = fuse_layout_attn_out_for_uv(
+                        out, actual_num_heads, out=layout_out
+                    )
+                else:
+                    out = fuse_layout_attn_out_for_uv(out, actual_num_heads)
             else:
                 out = out[:, :, :actual_num_heads, :]
             lse = lse[:, :actual_num_heads, :]
@@ -1483,15 +1509,19 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     self._use_glm_mega_attn_phase1()
                     and self.kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS
                 ):
-                    # Fused RoPE-slot zero + optional FP8 decode head pad in
-                    # one custom op. FlashMLA sparse body stays unchanged.
+                    # Fused RoPE-slot zero + FP8 decode head pad into the
+                    # reserved q_concat workspace (no per-call new_empty).
+                    # FlashMLA sparse body stays unchanged.
                     pad_heads = self.fp8_decode_padded_heads
-                    q = fuse_prepare_q_nope_fp8_decode(
+                    assert q.shape[1] >= pad_heads and q.shape[2] == self.q_head_size
+                    q = q[:, :pad_heads, :]
+                    fuse_prepare_q_nope_fp8_decode(
                         ql_nope,
                         num_q_heads=ql_nope.shape[1],
                         pad_q_heads=pad_heads,
                         q_head_size=self.q_head_size,
                         kv_lora_rank=self.kv_lora_rank,
+                        out=q,
                     )
                     actual_num_heads = ql_nope.shape[1]
                     self._phase1_actual_num_heads = actual_num_heads
