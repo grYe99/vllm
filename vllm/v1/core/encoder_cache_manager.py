@@ -146,6 +146,10 @@ class EncoderCacheManager:
         mm_hash = request.mm_features[input_id].identifier
         return self.num_embeds_by_hash.get(mm_hash)
 
+    def get_cached_num_encoder_embeds_by_hash(self, mm_hash: str) -> int | None:
+        """Read-only count for a hash, without a request to bind a ref to."""
+        return self.num_embeds_by_hash.get(mm_hash)
+
     def can_allocate(
         self,
         request: Request,
