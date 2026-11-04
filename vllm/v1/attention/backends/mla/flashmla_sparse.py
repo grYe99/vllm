@@ -33,6 +33,13 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.glm_mega_attn_phase1 import (
+    ensure_glm_mega_attn_phase1_ready,
+    fuse_layout_attn_out_for_uv,
+    fuse_pad_q_heads,
+    fuse_prepare_q_nope_fp8_decode,
+    is_glm_mega_attn_phase1_requested,
+)
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
     align_blocks_to_rows,
@@ -773,6 +780,16 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 // self.prefill_padding
                 * self.prefill_padding
             )
+        # Phase-1 may pack NoPE Q directly into the FP8 decode head-padded
+        # workspace (64/128). Reserve capacity when the opt-in flag is set;
+        # the fused path itself still fail-closes on non-SM90 at first use.
+        self._glm_mega_attn_phase1: bool | None = None
+        if (
+            is_glm_mega_attn_phase1_requested()
+            and is_quantized_kv_cache(kv_cache_dtype)
+            and self.qk_rope_head_dim == 0
+        ):
+            q_concat_heads = max(q_concat_heads, self.fp8_decode_padded_heads)
         q_concat_shape = (max_tokens, q_concat_heads, self.q_head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
             assert kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS, (
@@ -1295,26 +1312,45 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # DCP combines (reduce_scatter, direct A2A) need packed heads.
         return out.contiguous(), lse
 
+    def _use_glm_mega_attn_phase1(self) -> bool:
+        """Lazy opt-in gate for Phase-1 MegaAttention-style fuse (SM90 only)."""
+        if self._glm_mega_attn_phase1 is None:
+            # Fail closed on non-SM90 when the env flag is set.
+            self._glm_mega_attn_phase1 = ensure_glm_mega_attn_phase1_ready()
+        return self._glm_mega_attn_phase1
+
     def _fp8_flash_mla_kernel(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
+        actual_num_heads: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # q shape: (batch, seq_len, num_heads, head_dim)
-        actual_num_heads = q.size(2)
+        if actual_num_heads is None:
+            stashed = getattr(self, "_phase1_actual_num_heads", None)
+            actual_num_heads = stashed if stashed is not None else q.size(2)
         padded_num_heads = self.fp8_decode_padded_heads
+        use_phase1 = self._use_glm_mega_attn_phase1()
 
         # Pad query if needed (kernel only supports h_q = 64 or 128)
-        if actual_num_heads < padded_num_heads:
+        if q.size(2) < padded_num_heads:
             logger.warning_once(
-                f"Padding num_heads from {actual_num_heads} to "
+                f"Padding num_heads from {q.size(2)} to "
                 f"{padded_num_heads} for FP8 sparse decode kernel"
             )
-            q_padded = q.new_zeros((q.size(0), q.size(1), padded_num_heads, q.size(3)))
-            q_padded[:, :, :actual_num_heads, :] = q
-            q = q_padded
+            if use_phase1:
+                q = fuse_pad_q_heads(q, padded_num_heads)
+            else:
+                q_padded = q.new_zeros(
+                    (q.size(0), q.size(1), padded_num_heads, q.size(3))
+                )
+                q_padded[:, :, : q.size(2), :] = q
+                q = q_padded
+        elif q.size(2) > actual_num_heads:
+            # Phase-1 may have pre-padded heads in forward_mqa.
+            assert q.size(2) == padded_num_heads
 
         out, lse = flash_mla_with_kvcache(
             q=q,
@@ -1329,8 +1365,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         )
 
         # Slice output and lse back to actual head count if we padded
-        if actual_num_heads < padded_num_heads:
-            out = out[:, :, :actual_num_heads, :]
+        if out.size(2) > actual_num_heads:
+            if use_phase1:
+                out = fuse_layout_attn_out_for_uv(out, actual_num_heads)
+            else:
+                out = out[:, :, :actual_num_heads, :]
             lse = lse[:, :actual_num_heads, :]
 
         return out, lse
@@ -1430,6 +1469,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
 
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         actual_num_heads = self.num_heads
+        self._phase1_actual_num_heads: int | None = None
         if isinstance(q, tuple):
             ql_nope, q_pe = q
             q_concat_buffer, *_ = current_workspace_manager().get_simultaneous(
@@ -1439,9 +1479,26 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             if q_pe.size(-1) == 0:
                 # NoPE (GLM5Next): concat_mla_q requires rope_dim == 64,
                 # copy directly into the head-padded buffer instead.
-                q[:, : ql_nope.shape[1], : self.kv_lora_rank].copy_(ql_nope)
-                if self.q_head_size > self.kv_lora_rank:
-                    q[..., self.kv_lora_rank :].zero_()
+                if (
+                    self._use_glm_mega_attn_phase1()
+                    and self.kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS
+                ):
+                    # Fused RoPE-slot zero + optional FP8 decode head pad in
+                    # one custom op. FlashMLA sparse body stays unchanged.
+                    pad_heads = self.fp8_decode_padded_heads
+                    q = fuse_prepare_q_nope_fp8_decode(
+                        ql_nope,
+                        num_q_heads=ql_nope.shape[1],
+                        pad_q_heads=pad_heads,
+                        q_head_size=self.q_head_size,
+                        kv_lora_rank=self.kv_lora_rank,
+                    )
+                    actual_num_heads = ql_nope.shape[1]
+                    self._phase1_actual_num_heads = actual_num_heads
+                else:
+                    q[:, : ql_nope.shape[1], : self.kv_lora_rank].copy_(ql_nope)
+                    if self.q_head_size > self.kv_lora_rank:
+                        q[..., self.kv_lora_rank :].zero_()
             else:
                 ops.concat_mla_q(ql_nope, q_pe, q)
         else:
