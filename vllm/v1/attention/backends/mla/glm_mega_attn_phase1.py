@@ -8,7 +8,8 @@ several small launches around that body:
 
 1. Q layout / pad into the FP8 FlashMLA workspace (RoPE slot + heads → 64/128)
 2. FlashMLA sparse attention kernel (unchanged; keep existing FlashMLA sparse)
-3. Attention output unpad + contiguous layout for the subsequent ``W_UV`` bmm
+3. Attention output unpad + contiguous layout for ``W_UV`` / DCP LSE paths
+   that need packed heads (non-DCP decode keeps the baseline free slice)
 
 True SM100 MegaAttention kernels (``FLASHMLA_MEGA_ATTN_DSV41``) are out of
 scope for Hopper. Phase-1 therefore fuses the *pre* and *post* layout steps

@@ -55,11 +55,22 @@ hot path and stays CUDA-graph friendly via registered custom ops.
 ## Workspace reuse (alloc hygiene)
 
 `forward_mqa` already reserves a `q_concat` buffer via
-`current_workspace_manager`. Phase-1 fused Q-prep **writes into that buffer**
-(`out=`) instead of calling `new_empty` every decode step. Pad / out-layout
-ops similarly accept an optional `out=` and reuse the reserved FP8 workspace
-slots when shapes match. FlashMLA sparse (`flash_mla_with_kvcache`) is
-unchanged.
+`current_workspace_manager`. For FP8 sparse decode the buffer is sized to the
+kernel's padded head count (64/128) so both baseline pad and Phase-1 fuse can
+write in-place — `new_zeros` / `new_empty` during CUDA graph capture invalidates
+the stream (`cudaErrorStreamCaptureInvalidated`). Phase-1 fused Q-prep /
+pad write into that buffer (`out=`).
+
+**Out-layout policy:** the baseline returns a free head slice; `_v_up_proj`
+tolerates it. Phase-1 only runs the materializing layout fuse when DCP LSE
+merge needs packed contiguous heads (`need_to_return_lse_for_decode`). Always-on
+layout fuse was measured ~+100µs eager on H200 microbench (B1 ≈ +119% vs B0).
+
+FlashMLA sparse body (`flash_mla_with_kvcache` / `sparse_decode_fwd`) is
+unchanged. If full-forward `do_bench_cudagraph` still fails after pad is
+workspace-backed, the residual blocker is inside that body (fresh `out`/`lse`
+or scheduler metadata alloc during capture) — not Phase-1 layout ops (those
+capture cleanly in the layout µs harness).
 
 ## Code map
 

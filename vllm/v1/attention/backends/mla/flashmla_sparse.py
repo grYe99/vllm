@@ -38,7 +38,6 @@ from vllm.v1.attention.backends.mla.glm_mega_attn_phase1 import (
     fuse_layout_attn_out_for_uv,
     fuse_pad_q_heads,
     fuse_prepare_q_nope_fp8_decode,
-    is_glm_mega_attn_phase1_requested,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -780,15 +779,13 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 // self.prefill_padding
                 * self.prefill_padding
             )
-        # Phase-1 may pack NoPE Q directly into the FP8 decode head-padded
-        # workspace (64/128). Reserve capacity when the opt-in flag is set;
-        # the fused path itself still fail-closes on non-SM90 at first use.
+        # FP8 sparse decode always pads heads to 64/128 inside
+        # ``_fp8_flash_mla_kernel``. Reserve that capacity in q_concat so both
+        # baseline (zero_/copy_) and Phase-1 fuse can write into workspace
+        # instead of ``new_zeros`` / ``new_empty`` every step (CUDA-graph +
+        # eager alloc hygiene). Phase-1 still fail-closes on non-SM90 at use.
         self._glm_mega_attn_phase1: bool | None = None
-        if (
-            is_glm_mega_attn_phase1_requested()
-            and is_quantized_kv_cache(kv_cache_dtype)
-            and self.qk_rope_head_dim == 0
-        ):
+        if is_quantized_kv_cache(kv_cache_dtype):
             q_concat_heads = max(q_concat_heads, self.fp8_decode_padded_heads)
         q_concat_shape = (max_tokens, q_concat_heads, self.q_head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -1334,31 +1331,34 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         padded_num_heads = self.fp8_decode_padded_heads
         use_phase1 = self._use_glm_mega_attn_phase1()
 
-        # Pad query if needed (kernel only supports h_q = 64 or 128)
+        # Pad query if needed (kernel only supports h_q = 64 or 128).
+        # Always prefer the reserved q_concat workspace: ``new_zeros`` /
+        # ``new_empty`` inside ``do_bench_cudagraph`` / engine capture
+        # invalidates the stream (cudaErrorStreamCaptureInvalidated).
         if q.size(2) < padded_num_heads:
             logger.warning_once(
                 f"Padding num_heads from {q.size(2)} to "
                 f"{padded_num_heads} for FP8 sparse decode kernel"
             )
-            if use_phase1:
-                # Reuse q_concat workspace capacity when the 4D query can be
-                # reshaped onto the reserved [T, pad_H, D] buffer; otherwise
-                # allocate once via the fuse fallback.
-                b, s, h, d = q.shape
-                q_concat_buffer, *_ = current_workspace_manager().get_simultaneous(
-                    *self.workspace_specs
-                )
-                flat_out = q_concat_buffer[: b * s, :padded_num_heads, :d]
-                if flat_out.shape == (b * s, padded_num_heads, d):
-                    q_out = flat_out.view(b, s, padded_num_heads, d)
+            b, s, h, d = q.shape
+            workspaces = current_workspace_manager().get_simultaneous(
+                *self.workspace_specs
+            )
+            q_concat_buffer = workspaces[0]
+            flat_out = q_concat_buffer[: b * s, :padded_num_heads, :d]
+            if flat_out.shape == (b * s, padded_num_heads, d):
+                q_out = flat_out.view(b, s, padded_num_heads, d)
+                if use_phase1:
                     q = fuse_pad_q_heads(q, padded_num_heads, out=q_out)
                 else:
-                    q = fuse_pad_q_heads(q, padded_num_heads)
+                    q_out.zero_()
+                    q_out[:, :, :h, :].copy_(q)
+                    q = q_out
+            elif use_phase1:
+                q = fuse_pad_q_heads(q, padded_num_heads)
             else:
-                q_padded = q.new_zeros(
-                    (q.size(0), q.size(1), padded_num_heads, q.size(3))
-                )
-                q_padded[:, :, : q.size(2), :] = q
+                q_padded = q.new_zeros((b, s, padded_num_heads, d))
+                q_padded[:, :, :h, :] = q
                 q = q_padded
         elif q.size(2) > actual_num_heads:
             # Phase-1 may have pre-padded heads in forward_mqa.
@@ -1376,11 +1376,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             softmax_scale=self.softmax_scale,
         )
 
-        # Slice output and lse back to actual head count if we padded
+        # Slice output and lse back to actual head count if we padded.
+        # Baseline returns a free head slice; ``_v_up_proj`` / reshape tolerate
+        # the non-contiguous view. Only materialize contiguous heads via the
+        # Phase-1 layout fuse when DCP LSE merge needs packed storage — the
+        # previous always-on fuse added an extra Triton launch (~+100µs eager)
+        # and was the main B1 microbench regression vs B0.
         if out.size(2) > actual_num_heads:
-            if use_phase1:
-                # Prefer the reserved compact_out workspace (last FP8 spec)
-                # so unpad/layout does not allocate every decode step.
+            if use_phase1 and self.need_to_return_lse_for_decode:
                 *_, compact_out = current_workspace_manager().get_simultaneous(
                     *self.workspace_specs
                 )
