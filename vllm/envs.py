@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_USE_FUSED_MQA_TOPK: bool = True
+    VLLM_GLM_MEGA_ATTN_PHASE1: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1127,6 +1128,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path. Default: on (set to 0 for the dense path).
     "VLLM_USE_FUSED_MQA_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MQA_TOPK", "1"))
+    ),
+    # Opt-in Phase-1 MegaAttention-style fuse for GLM sparse MLA decode on
+    # SM90 (Hopper): fused Q layout-pad + FlashMLA sparse + out layout before
+    # o_proj absorb. Default off. Fail closed on non-SM90 when set.
+    "VLLM_GLM_MEGA_ATTN_PHASE1": lambda: bool(
+        int(os.getenv("VLLM_GLM_MEGA_ATTN_PHASE1", "0"))
     ),
     # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
     # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
