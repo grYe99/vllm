@@ -269,9 +269,9 @@ Record these stages with monotonic host timings and CUDA events where relevant:
 - client send-to-first-nonempty-token TTFT, completion latency, TPOT, request
   throughput, output throughput, failure/timeout/retry counts and tail latency.
 
-Export Store bandwidth per rank and total. TP4 reads can cost approximately
-four embedding objects per cross-hit versus one E GET in the relay baseline;
-report observed bytes, including metadata/retries, rather than assuming a win.
+Export actual Store calls, bytes and bandwidth, including metadata/retries,
+rather than assuming a win. Validate against the existing TP4 receiving-worker
+and completion contract; redesigning TP distribution is outside this experiment.
 Successful-path assertions exclude unrelated tokenizer/input H2D from the
 “zero E embedding H2D” requirement. Source profiling must identify payloads.
 
@@ -331,7 +331,7 @@ Proposed decision gates, fixed before examining performance results:
 4. Local-hit/cold-miss controls should remain within a predeclared 2% p50
    regression budget; investigate changes above noise and all p95 regressions
    above 5%. Underpowered/noisy comparisons remain inconclusive, not passed.
-5. If TP4 Store egress or P-side stalls erase the gain, record that result and
+5. If Store I/O or P-side stalls erase the gain, record that result and
    do not open a production performance PR merely because the path is shorter.
 
 TCP and RDMA are separate experiments. Start with the functioning, explicitly

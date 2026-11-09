@@ -33,7 +33,8 @@ GPUs total. “4PD” here means the four ranks of that one PD, not four replica
 
 Non-goals: P-first scheduling, deciding Encoder admission from P prefix-KV
 coverage, a Store-only connector, CUDA kernels, Mooncake internals, video/audio
-reuse, E TP/PP/DP, dynamic LoRA, and GPU-direct Store reads. Keep current image,
+reuse, E TP/PP/DP, redesigning PD's TP distribution, dynamic LoRA, and GPU-direct
+Store reads. Keep current image,
 MRv2, contiguous 2D FP16/BF16/FP32 and RAM-Store limitations.
 
 ## Source baseline and related work
@@ -273,10 +274,10 @@ the general cache manager.
   user `ec_transfer_params`. Reject shape/size overflow, unsupported dtype,
   namespace/protocol mismatch and conflicting transfer identities before I/O.
   No arbitrary server URL or memory address is accepted as a Store descriptor.
-- P receiving ranks need their own Store clients and CPU buffers. At TP4, four
-  rank-local GETs are the conservative design; they may multiply Store egress
-  versus one E GET. Measure this explicitly. Rank-0 GET plus TP broadcast is a
-  separate possible optimization, not part of this PoC.
+- Integrate Store consumption with the connector's existing receiving-worker
+  topology and readiness aggregation. This proposal changes the delivery
+  source, not TP distribution. Account for reader buffers and actual Store I/O
+  in validation; no new TP broadcast or distribution mechanism is in scope.
 - Current receive-pool resident leases, TTLs and tombstones still own published
   tensors. Backpressure, shutdown and unknown-I/O retention apply equally to
   Store and P2P writers. Stop job admission, settle jobs, drain completion queues,
@@ -289,7 +290,7 @@ the general cache manager.
 The gain is removal of E-side read staging, E H2D/allocation and E payload
 forwarding on successful cross-E hits. E preprocessing, Store existence lookup,
 control requests, encoder budget reservation and waits remain. The conservative
-P implementation adds D2D and four independent TP-rank reads. Large Store RTT,
+P implementation adds a D2D handoff. Large Store RTT,
 bandwidth saturation, or blocking E batches on P may erase or reverse the gain.
 
 Baseline #56242 already skips ViT on a Store hit. Counting fewer ViT forwards
