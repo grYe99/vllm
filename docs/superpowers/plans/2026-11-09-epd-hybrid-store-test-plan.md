@@ -12,6 +12,37 @@ each request; keep the PD and GPU mapping fixed across comparisons.
 
 **Spec:** [design and source analysis](../specs/2026-11-09-epd-hybrid-store-design.md).
 
+**Feasibility and patch scope:**
+[latest upstream report](../../design/epd_hybrid_push_store_feasibility.md).
+
+## Minimal implementation gates
+
+Implementation is not started. The report checks upstream main
+`a3c14efbc77c018e8bf579935095a87721349e05` as well as this branch's fork base.
+Work through these gates before the full lab matrix below:
+
+1. **Protocol proof:** lookup-only backend, per-item control handoff and bounded
+   P reader, actual tensor readiness and source-free E completion. Test that
+   the reader runs before any P inference request exists. Use existing
+   cross-cache/control/protocol/worker suites with native I/O faked.
+2. **Runner/cache closure:** explicit remote satisfaction and scheduler
+   nonresident feedback. A second same-image request after Store eviction must
+   recheck/encode rather than see a false E-local hit. Cover mixed/repeated
+   inputs and preserve real resident tensors and reference/budget accounting.
+3. **Real fail-fast PoC:** one receiving worker's Store roundtrip, then the
+   agreed full Flash 2E TP1 + PD TP4 topology. Prove cross-E and mixed delivery;
+   GET failure must explicitly terminate and safely settle owned buffers.
+   This does not establish automatic retry or production fallback.
+4. **Production evidence:** add and validate same-request E fallback for safe
+   recoverable GET failures before E returns, compatibility/default-off behavior,
+   cancellation/shutdown and the paired performance matrix below. Update
+   rendered usage docs for the actual shipped option and support limits.
+
+No gate changes Proxy scheduling, adds a Store-only connector or redesigns TP
+distribution. Source selection before reservation in the simple PoC can lose
+current cold-path overlap; measure it rather than assuming unchanged P2P payload
+code means unchanged latency. The fallback assertions below belong to gate 4.
+
 ## Constraints and observed environment
 
 Read-only discovery on 2026-11-09 found:
@@ -324,10 +355,12 @@ Proposed decision gates, fixed before examining performance results:
    tensor mismatches or unreclaimed live buffers.
 2. Every successful cross-hit eliminates the E payload path and unnecessary
    ViT work remains zero in **both** B and C.
-3. For practical value, target at least 3% lower p50 TTFT in the primary
-   representative cross-hit cell, with the paired-run interval excluding zero,
-   plus either improved saturation throughput or lower E resource use under
-   mixed load. This is a proposed engineering threshold, not a predicted gain.
+3. Before measurement, choose a primary practical-value criterion: at least 3%
+   lower p50 TTFT in the representative cross-hit cell, with the paired-run
+   interval excluding zero; or a separately quantified E resource/headroom or
+   saturation-throughput benefit without material TTFT regression. Account for
+   costs moved to P. This is a proposed gate, not a predicted gain; any resource
+   threshold must also be fixed before examining results.
 4. Local-hit/cold-miss controls should remain within a predeclared 2% p50
    regression budget; investigate changes above noise and all p95 regressions
    above 5%. Underpowered/noisy comparisons remain inconclusive, not passed.

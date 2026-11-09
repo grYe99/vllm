@@ -1,22 +1,27 @@
 # Hybrid Mooncake Store delivery for E-first EPD
 
-Status: proposed design; source-review only. No implementation or serving
-measurement is included in this branch. AI assistance was used to prepare this
-document. Companion: [test plan](../plans/2026-11-09-epd-hybrid-store-test-plan.md).
+Status: candidate detailed protocol; source-review only. The
+[feasibility report](../../design/epd_hybrid_push_store_feasibility.md) records
+the handoff assessment, latest upstream check, API gaps and minimal patch plan.
+No implementation or serving measurement is included in this branch. AI
+assistance was used to prepare this document. Companion:
+[test plan](../plans/2026-11-09-epd-hybrid-store-test-plan.md).
 
 ## Decision and scope
 
-The idea is feasible and worth a bounded experiment. Preserve E-first dispatch,
+Conditional GO for a bounded protocol PoC, not yet for a production PR.
+Preserve E-first dispatch,
 `ECMooncakeConnector`, local-output P2P delivery, and cold-encode P2P delivery.
 For an E-local miss with a shared Store hit, let the selected P/PD worker load
 the embedding instead of relaying its payload through E.
 
-The first implementation should confirm P-side acquisition before E skips that
-item. Recoverable Store-read failures can then return to the existing E-side
-resolver/encode path in the same request. This is a design choice, not an
-already implemented capability. It trades additional control coordination for
-a smaller failure protocol than accepting a Store reference and recovering
-after the E request has finished.
+The first PoC should confirm P-side acquisition before E skips that item and
+fail the request explicitly on acquisition failure. The production candidate
+below adds same-request E fallback for confirmed recoverable failures. Both
+stages require new control and completion semantics: current delivery is push,
+and no existing consumer Store-load operation can simply be enabled. Keeping
+raw inputs until P confirms acquisition is a design choice, not an already
+implemented capability or an established optimal pipeline.
 
 Two qualifications matter:
 
@@ -36,6 +41,11 @@ coverage, a Store-only connector, CUDA kernels, Mooncake internals, video/audio
 reuse, E TP/PP/DP, redesigning PD's TP distribution, dynamic LoRA, and GPU-direct
 Store reads. Keep current image,
 MRv2, contiguous 2D FP16/BF16/FP32 and RAM-Store limitations.
+
+For confirmed prefetch, GET runs through P's already active control service,
+independently of its inference request. Putting GET only in P's normal load
+hook while E waits for it would deadlock, because the unchanged Proxy waits for
+E before sending P its request. Reuse the control channel; extend its semantics.
 
 ## Source baseline and related work
 
@@ -126,9 +136,10 @@ asynchronous and best-effort; E HTTP completion is not a PUT acknowledgement.
    P2P source bandwidth on cross-E hits.
 2. **Confirmed P prefetch — recommended first experiment.** E classifies each
    output and requests P acquisition on Store hits before running its remaining
-   encoder inputs. Successful items never become E payloads. Recoverable
-   failures remain within the current E request. Control overhead and blocking
-   of the E batch are explicit costs to measure.
+   encoder inputs. Successful items never become E payloads. The initial PoC
+   fails explicitly on acquisition failure; the production candidate adds
+   same-request recovery. Control overhead and blocking of the E batch are
+   explicit costs to measure.
 3. **Unconfirmed Store reference, load after E returns.** Could allow more
    overlap, but requires persistent references, a later E recomputation service
    or a coordinated proxy retry with force-P2P state. The current metadata-only
