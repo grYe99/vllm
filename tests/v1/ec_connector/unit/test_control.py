@@ -1203,3 +1203,85 @@ def test_poisoned_reader_degrades_reserve_to_p2p(native_free_workers):
     with contextlib.suppress(EmbeddingStoreError):
         client.close()
     consumer._store_reader = None
+
+
+def test_poisoned_store_writer_does_not_capture_same_key_p2p_retry(native_free_workers):
+    """A new request must not follow a poisoned writer that can never finish."""
+    import torch
+
+    consumer = native_free_workers()
+    manager = consumer._reservations
+    old, _ = manager.reserve(
+        "unsafe", "img", 16, (2, 2), "float32", torch.float32, source="store"
+    )
+    assert old is not None and old.allocation is not None
+    allocation = old.allocation
+    allocation.tensor.fill_(-1)
+    manager.complete_store(
+        "unsafe", old.reservation_id, ok=False, safe=False, error="unconfirmed"
+    )
+    try:
+        new, write = manager.reserve(
+            "retry", "img", 16, (2, 2), "float32", torch.float32, source="p2p"
+        )
+        assert new is not None and write
+        assert not new.writer_id
+        assert new.allocation is not allocation
+        assert new.allocation is not None
+        new.allocation.tensor.fill_(5)
+        assert manager.complete("retry", new.reservation_id) == (True, True)
+        assert torch.equal(manager.take("retry", "img").tensor, torch.full((2, 2), 5.0))
+        assert old.allocation is allocation
+        assert torch.equal(allocation.tensor, torch.full((2, 2), -1.0))
+    finally:
+        # Only this test's simulated native writer is now confirmed settled.
+        manager.complete_store("unsafe", old.reservation_id, ok=False, safe=True)
+
+
+def test_queued_read_after_poison_is_a_safe_failure():
+    """A queued job that never entered native I/O must permit safe fallback."""
+    import threading
+
+    import torch
+
+    from tests.v1.ec_connector.unit.test_cross_encoder_cache import MemoryStore
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockedStore(MemoryStore):
+        def batch_get_into(self, *args):
+            started.set()
+            assert release.wait(timeout=5)
+            raise RuntimeError("unconfirmed native completion")
+
+    client = MooncakeEmbeddingStoreClient(BlockedStore(), read_buffer_bytes=1024)
+    reader = StoreDeliveryReader(
+        client,
+        device="cpu",
+        max_pending_items=2,
+        max_pending_bytes=1024,
+        read_buffer_bytes=1024,
+    )
+    try:
+        for transfer_id in ("first", "queued"):
+            assert reader.enqueue(
+                StoreReadRequest(
+                    transfer_id,
+                    transfer_id,
+                    transfer_id,
+                    "namespace",
+                    TensorSpec((2, 2), "torch.float32", 16),
+                    torch.empty(2, 2),
+                )
+            )
+            if transfer_id == "first":
+                assert started.wait(timeout=5)
+    finally:
+        release.set()
+        reader.shutdown(wait=True)
+    results = {completion.transfer_id: completion for completion in reader.drain()}
+    assert not results["first"].safe
+    assert not results["queued"].ok
+    assert results["queued"].safe
+    assert not reader.can_admit(16)

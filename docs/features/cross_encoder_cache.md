@@ -92,6 +92,12 @@ Keep `cross_encoder_cache: true` on E only; that flag is producer-only. Set
 matching model/revision, cache prefix and dtype settings. Both instances require
 Model Runner V2. No Proxy scheduling change is needed.
 
+On E, also set `--no-async-scheduling`. Hybrid delivery currently requires
+synchronous Encoder scheduling: a later batch must not reuse an optimistic
+local-cache entry before the previous batch reports a remote-only result.
+P can retain asynchronous scheduling. Asynchronous E is rejected at startup
+when this option is enabled.
+
 E-local hits and newly computed outputs still use E→P P2P push. For an E-local
 miss with a Store hit, E sends a descriptor through the control channel and
 waits for P's background reader to acquire it. P validates the existing v3
@@ -103,6 +109,11 @@ normal relay. Confirmed recoverable GET failures fall back to E loading or
 encoding the input and pushing it. Unconfirmed I/O fails the delivery and
 retains affected buffer owners; cancellation does not permit reusing a buffer
 while its local GET may still be running.
+
+A poisoned reader refuses new Store reads. Queued jobs that have not entered
+native I/O fail safely and can use E's relay. A new request for the same image
+can obtain a separate P2P allocation while the original uncertain allocation
+remains retained; it never writes into that unsafe allocation.
 
 This mode can block an E batch while waiting for P. Measure TTFT, Store load
 and E/P memory use against the default Store-enabled relay before deployment;

@@ -148,6 +148,20 @@ class StoreDeliveryReader:
 
     def _run(self, request: StoreReadRequest) -> None:
         tensor: torch.Tensor | None = None
+        if self._client._poisoned:
+            # An earlier serialized job poisoned the client; this job has not
+            # entered native I/O and its destination can be safely reclaimed.
+            self._completions.put(
+                StoreReadCompletion(
+                    request.transfer_id,
+                    request.reservation_id,
+                    request.mm_hash,
+                    ok=False,
+                    safe=True,
+                    error="Store reader unavailable before I/O",
+                )
+            )
+            return
         try:
             if self._device.type == "cuda":
                 torch.accelerator.set_device_index(self._device.index or 0)

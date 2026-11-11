@@ -128,6 +128,14 @@ class MooncakeECConfig:
                     "prefill_store_delivery requires cross_encoder_cache=true "
                     "on the Encoder"
                 )
+            if (
+                ec_config.is_ec_producer
+                and vllm_config.scheduler_config.async_scheduling
+            ):
+                raise ValueError(
+                    "prefill_store_delivery requires --no-async-scheduling "
+                    "on the Encoder to avoid in-flight nonresident cache hits"
+                )
         control_port = int(ec_config.ec_port) + (
             parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
         )

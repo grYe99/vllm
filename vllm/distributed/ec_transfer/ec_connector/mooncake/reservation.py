@@ -189,7 +189,11 @@ class ConsumerReservationManager:
                 self._insert(record)
                 return record, False
             writer = self._writers.get(mm_hash)
-            if writer is not None and writer.state is ConsumerReservationState.WRITING:
+            if (
+                writer is not None
+                and writer.state is ConsumerReservationState.WRITING
+                and not writer.store_io_retained
+            ):
                 if writer.shape != shape or writer.dtype != dtype_name:
                     raise ValueError("conflicting in-flight tensor for mm_hash")
                 record = ConsumerReservation(

@@ -114,6 +114,10 @@ Python commands. Keep the full checkpoint and existing services unchanged.
   attention/quantization/graph settings in both arms. Start with eager E graphs
   disabled for mechanism checks, then test one fixed graph setting in both
   performance arms. Keep `mm_processor_cache_gb > 0` throughout.
+- [ ] Set `--no-async-scheduling` on E in both arms. The implemented experimental
+  hybrid mode rejects asynchronous E scheduling to prevent an in-flight
+  remote-only output from becoming a false local hit. Keep P's scheduling
+  setting identical in both arms; asynchronous P remains supported.
 
 Suggested loopback assignment, subject to free-port checks: E0 HTTP 18100,
 E1 HTTP 18101, PD HTTP 18200, PD EC control base 19100 (ranks 19100–19103),
