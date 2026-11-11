@@ -42,6 +42,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data imp
     make_embedding_key,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.store_client import (  # noqa: E501
+    EmbeddingStoreError,
     MooncakeEmbeddingStoreClient,
 )
 
@@ -1122,3 +1123,83 @@ def test_unconfirmed_reader_retains_destination_owner(monkeypatch):
     del request, destination
     gc.collect()
     assert owner() is not None
+
+
+@pytest.mark.cpu_test
+def test_poisoned_reader_degrades_reserve_to_p2p(native_free_workers):
+    """After unconfirmed I/O poisons the client, the consumer must refuse new
+    Store admissions and answer with a normal P2P reservation instead of
+    hard-failing every later store delivery until a restart."""
+    from tests.v1.ec_connector.unit.test_cross_encoder_cache import MemoryStore
+
+    consumer = native_free_workers()
+    client = MooncakeEmbeddingStoreClient(MemoryStore(), read_buffer_bytes=1024)
+    reader = StoreDeliveryReader(
+        client,
+        device="cpu",
+        max_pending_items=2,
+        max_pending_bytes=1024,
+        read_buffer_bytes=1024,
+    )
+    consumer._store_reader = reader
+    namespace = (
+        "lab@embedding@model:glm-test@revision:default@encoder:any"
+        "@dtype:torch.bfloat16@protocol:v3"
+    )
+    consumer._store_namespace = namespace
+
+    def reserve_payload(transfer_id: str, mm_hash: str) -> dict[str, object]:
+        return {
+            "transfer_id": transfer_id,
+            "mm_hash": mm_hash,
+            "nbytes": 16,
+            "shape": [2, 2],
+            "dtype": "float32",
+            "store": {
+                "namespace": namespace,
+                "identifier": mm_hash,
+                "protocol": "v3",
+                "shape": [2, 2],
+                "dtype": "torch.float32",
+                "nbytes": 16,
+            },
+        }
+
+    # Healthy wiring check: the descriptor is admitted and stays Store-sourced.
+    assert reader.can_admit(16)
+    healthy = consumer._reserve_push_destination(reserve_payload("deg-0", "img-a"))
+    assert healthy["store_pending"] is True
+    assert healthy["write"] is False
+
+    # An unconfirmed native completion poisons the client permanently.
+    client._poison([object()])
+    assert not reader.can_admit(16)
+
+    degraded = consumer._reserve_push_destination(reserve_payload("deg-1", "img-b"))
+    assert degraded["store_pending"] is False
+    assert degraded["write"] is True
+    assert degraded["reservation_id"]
+    record = consumer._reservations.status("deg-1")
+    assert record is not None and record.source == "p2p"
+
+    # Teardown hygiene: settle both records and detach the poisoned reader
+    # (a poisoned client refuses close by design — "worker must exit").
+    accepted, _ = consumer._reservations.complete(
+        "deg-1", str(degraded["reservation_id"])
+    )
+    assert accepted
+    reader.shutdown(wait=True)
+    # Settle the healthy call's record the way the control loop would (the
+    # fixture's control server was wired before the reader was injected).
+    for completion in reader.drain():
+        consumer._reservations.complete_store(
+            completion.transfer_id,
+            completion.reservation_id,
+            ok=completion.ok,
+            safe=completion.safe,
+        )
+    import contextlib
+
+    with contextlib.suppress(EmbeddingStoreError):
+        client.close()
+    consumer._store_reader = None

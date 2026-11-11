@@ -84,6 +84,11 @@ class StoreDeliveryReader:
     def _can_admit_locked(self, nbytes: int) -> bool:
         if self._closed:
             return False
+        if self._client._poisoned:
+            # A poisoned client reports every later GET as unconfirmed; keep
+            # refusing admission so the producer degrades to the P2P relay
+            # instead of hard-failing each store delivery until a restart.
+            return False
         if len(self._pending) >= self._max_pending_items:
             return False
         return self._pending_bytes + nbytes <= self._max_pending_bytes
