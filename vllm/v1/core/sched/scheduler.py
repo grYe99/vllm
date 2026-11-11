@@ -2313,6 +2313,17 @@ class Scheduler(SchedulerInterface):
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        # Consume delivery failures before an encoder-only request can finish
+        # successfully and be removed from self.requests below.
+        failed_ec_req_ids: set[str] = set()
+        if self.ec_connector is not None:
+            if ec_connector_output:
+                self.ec_connector.update_connector_output(ec_connector_output)
+                nonresident = self.ec_connector.take_nonresident_outputs()
+                if nonresident:
+                    self.encoder_cache_manager.mark_nonresident(nonresident)
+            failed_ec_req_ids = self.ec_connector.take_unavailable_requests()
+
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
@@ -2360,8 +2371,10 @@ class Scheduler(SchedulerInterface):
                     output_is_stale = True
                     request.num_stale_output_tokens -= num_tokens_scheduled
                     assert request.num_stale_output_tokens >= 0
-            if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
-                # skip failed or rescheduled requests from KV load failure
+            if req_id in failed_ec_req_ids or (
+                failed_kv_load_req_ids and req_id in failed_kv_load_req_ids
+            ):
+                # Skip requests whose EC or KV delivery failed.
                 continue
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
@@ -2603,6 +2616,7 @@ class Scheduler(SchedulerInterface):
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
         error_req_ids = set(request_errors)
+        error_req_ids.update(failed_ec_req_ids)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -2631,17 +2645,6 @@ class Scheduler(SchedulerInterface):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
-
-        # EC Connector: update state from worker-side EC connector output.
-        if self.ec_connector is not None and ec_connector_output:
-            self.ec_connector.update_connector_output(ec_connector_output)
-            nonresident = self.ec_connector.take_nonresident_outputs()
-            if nonresident:
-                mark_nonresident = getattr(
-                    self.encoder_cache_manager, "mark_nonresident", None
-                )
-                if callable(mark_nonresident):
-                    mark_nonresident(nonresident)
 
         # Worker-side KV connector stats from the model runner output.
         kv_connector_stats: KVConnectorStats | None = (

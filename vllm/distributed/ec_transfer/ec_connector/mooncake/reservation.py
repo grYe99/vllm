@@ -249,6 +249,8 @@ class ConsumerReservationManager:
                 record = self._records.get(transfer_id)
                 if record is None or record.reservation_id != reservation_id:
                     return False, False
+                if record.source == "store":
+                    return False, False
                 if record.state is ConsumerReservationState.READY:
                     return True, False
                 if record.writer_id:
@@ -421,6 +423,15 @@ class ConsumerReservationManager:
                 self._set_tombstone_deadline(record)
                 self._reap_tombstones(time.monotonic())
                 return True
+            if (
+                record.source == "store"
+                and not record.writer_id
+                and record.state in _WRITER_OWNED_STATES
+            ):
+                # The sender cannot abandon a GET running on this consumer.
+                if record.state is ConsumerReservationState.WRITING:
+                    self._defer(record, ConsumerReservationState.CANCEL_PENDING)
+                return not refresh
             if refresh:
                 if not abandon or record.state not in {
                     ConsumerReservationState.WRITING,

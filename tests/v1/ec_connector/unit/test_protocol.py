@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import msgspec
+import pytest
 
 from vllm.distributed.ec_transfer.ec_connector.cpu.protocol import (
     EC_CONNECTOR_VERSION,
@@ -9,6 +10,8 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.protocol import (
     XferStatus,
     compute_ec_compatibility_hash,
 )
+
+pytestmark = pytest.mark.cpu_test
 
 
 def test_xferreq_roundtrip():

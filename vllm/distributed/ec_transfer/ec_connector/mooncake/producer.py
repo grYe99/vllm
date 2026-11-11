@@ -202,8 +202,9 @@ class ProducerPushManager:
     def resolve_reservations(self, record: ProducerPushRecord) -> list[dict[str, Any]]:
         results = record.reservation_future.result()
         with self._lock:
-            record.reservations = results
-            return list(results)
+            if not record.reservations:
+                record.reservations = results
+            return list(record.reservations)
 
     def finish_reservations(
         self,

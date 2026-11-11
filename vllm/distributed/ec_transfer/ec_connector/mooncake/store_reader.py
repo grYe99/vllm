@@ -142,6 +142,7 @@ class StoreDeliveryReader:
         self._executor.shutdown(wait=wait, cancel_futures=False)
 
     def _run(self, request: StoreReadRequest) -> None:
+        tensor: torch.Tensor | None = None
         try:
             if self._device.type == "cuda":
                 torch.accelerator.set_device_index(self._device.index or 0)
@@ -207,6 +208,7 @@ class StoreDeliveryReader:
             )
         except EmbeddingStoreError as exc:
             # Includes a poisoned client: native I/O may still be in flight.
+            self._client._poison([request, tensor])
             logger.error(
                 "Unconfirmed Mooncake Store GET for transfer_id=%s: %s",
                 request.transfer_id,
@@ -223,6 +225,8 @@ class StoreDeliveryReader:
                 )
             )
         except BaseException as exc:
+            # The final destination copy has its own lifetime after Store GET.
+            self._client._poison([request, tensor])
             logger.exception(
                 "Mooncake Store reader failed for transfer_id=%s",
                 request.transfer_id,

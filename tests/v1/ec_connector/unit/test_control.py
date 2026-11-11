@@ -5,11 +5,13 @@
 import socket
 import time
 from dataclasses import dataclass
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import zmq
 
+from vllm.config import DeviceConfig, ECTransferConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.cpu.control.base import (
     ControlConnection,
 )
@@ -21,6 +23,10 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
     MemoryAllocation,
     ResidentLease,
     _ResidentEntry,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
+    ECMooncakePushSpec,
+    StoreDeliverySpec,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.reservation import (
     ConsumerReservationManager,
@@ -38,6 +44,8 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data imp
 from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.store_client import (  # noqa: E501
     MooncakeEmbeddingStoreClient,
 )
+
+pytestmark = pytest.mark.cpu_test
 
 
 class _ConcreteConn(ControlConnection):
@@ -882,3 +890,235 @@ def test_store_reader_enqueue_does_not_deadlock_when_job_already_finished():
     finally:
         reader._executor = original
         reader.shutdown(wait=True)
+
+
+@pytest.fixture
+def native_free_workers(monkeypatch):
+    """Use real workers and pools; replace only the native Mooncake transport."""
+    from vllm.distributed.ec_transfer.ec_connector.mooncake import worker
+
+    class NativeTransport:
+        def __init__(self, *args):
+            pass
+
+        def register_memory(self, tensor):
+            return 0
+
+        def unregister_memory(self, tensor):
+            return True
+
+        def local_session(self):
+            return "test-session"
+
+        def write(self, session, sources, destinations, sizes):
+            import ctypes
+
+            for src, dst, size in zip(sources, destinations, sizes, strict=True):
+                ctypes.memmove(dst, src, size)
+
+        def release_sources(self, addresses):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "ensure_mooncake_available", lambda: None)
+    monkeypatch.setattr(worker, "MooncakeTransfer", NativeTransport)
+    workers = []
+
+    def create():
+        config = VllmConfig(
+            device_config=DeviceConfig(device="cpu"),
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="ECMooncakeConnector",
+                ec_role="ec_consumer",
+                ec_buffer_device="cpu",
+                ec_buffer_size=1024,
+                ec_port=_free_loopback_port(),
+                ec_connector_extra_config={"control_timeout_s": 1},
+            ),
+        )
+        instance = worker.ECMooncakeWorker(config)
+        instance.start_services()
+        workers.append(instance)
+        return instance
+
+    yield create
+    for instance in reversed(workers):
+        instance.close()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("refresh", [False, True])
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_store_writer_cannot_be_abandoned_by_remote_sender(
+    native_free_workers, refresh, unconfirmed
+):
+    """Remote cancellation cannot recycle a destination owned by local GET."""
+    import torch
+
+    consumer = native_free_workers()
+    manager = consumer._reservations
+    record, write = manager.reserve(
+        "store", "img", 16, (2, 2), "float32", torch.float32, source="store"
+    )
+    assert write and record is not None
+    allocation = record.allocation
+    if unconfirmed:
+        manager.complete_store(
+            "store", record.reservation_id, ok=False, safe=False, error="unconfirmed"
+        )
+    manager.cancel("store", record.reservation_id, abandon=True, refresh=refresh)
+    assert record.allocation is allocation
+    assert not manager.wait_for_writers(timeout=0)
+    manager.complete_store("store", record.reservation_id, ok=False, safe=True)
+    assert manager.wait_for_writers(timeout=0)
+
+
+@pytest.mark.cpu_test
+def test_partial_store_rejection_keeps_p2p_fallback_writable(native_free_workers):
+    """A resident rank plus a P2P-only rank must not wait for a nonexistent GET."""
+    from concurrent.futures import Future
+
+    coordinator = native_free_workers()
+    consumers = [native_free_workers(), native_free_workers()]
+    first = consumers[0]._reserve_push_destination(
+        dict(
+            transfer_id="mixed", mm_hash="img", nbytes=16, shape=[2, 2], dtype="float32"
+        )
+    )
+    consumers[0]._reservations.complete("mixed", first["reservation_id"])
+    spec = ECMooncakePushSpec(
+        "img",
+        16,
+        (2, 2),
+        "float32",
+        f"tcp://127.0.0.1:{consumers[0]._control_port}",
+        "mixed",
+    )
+    reservations = [
+        coordinator._reserve_one(f"tcp://127.0.0.1:{consumer._control_port}", spec)
+        for consumer in consumers
+    ]
+    future: Future[list[dict[str, Any]]] = Future()
+    future.set_result(reservations)
+    record, _ = coordinator._producer_pushes.reserve(spec, lambda: future)
+    outcome = coordinator._poll_store_shards(
+        record, reservations, time.monotonic() + 0.05
+    )
+    assert outcome == "failed_safe"
+    assert coordinator._re_reserve_failed_store_shards(record, reservations)
+    assert record.reservations[0]["ready"]
+    assert record.reservations[1]["write"]
+    assert not record.reservations[1].get("cancelled", False)
+
+
+@pytest.mark.cpu_test
+def test_remote_completion_cannot_publish_store_writer(native_free_workers):
+    """Only the local reader can declare a Store destination ready."""
+    import torch
+
+    consumer = native_free_workers()
+    manager = consumer._reservations
+    record, _ = manager.reserve(
+        "store", "img", 16, (2, 2), "float32", torch.float32, source="store"
+    )
+    assert record is not None
+    try:
+        assert manager.complete("store", record.reservation_id) == (False, False)
+        assert record.state is ConsumerReservationState.WRITING
+    finally:
+        manager.complete_store("store", record.reservation_id, ok=False, safe=True)
+
+
+def test_safe_store_failure_pushes_to_replacement_generation(native_free_workers):
+    """A safe failed GET must deliver real bytes through its new P2P reservation."""
+    from concurrent.futures import Future
+
+    import torch
+
+    coordinator = native_free_workers()
+    consumer = native_free_workers()
+    manager = consumer._reservations
+    original, _ = manager.reserve(
+        "retry", "img", 16, (2, 2), "float32", torch.float32, source="store"
+    )
+    assert original is not None
+    spec = ECMooncakePushSpec(
+        "img",
+        16,
+        (2, 2),
+        "float32",
+        f"tcp://127.0.0.1:{consumer._control_port}",
+        "retry",
+        store=StoreDeliverySpec(
+            "namespace", "img", TensorSpec((2, 2), "torch.float32", 16)
+        ),
+    )
+    reservations = [coordinator._reserve_one(spec.consumer_zmq, spec)]
+    future: Future[list[dict[str, Any]]] = Future()
+    future.set_result(reservations)
+    record, _ = coordinator._producer_pushes.reserve(spec, lambda: future)
+    manager.complete_store("retry", original.reservation_id, ok=False, safe=True)
+    assert (
+        coordinator._poll_store_shards(record, reservations, time.monotonic() + 1)
+        == "failed_safe"
+    )
+    assert coordinator._re_reserve_failed_store_shards(record, reservations)
+    replacement = manager.status("retry")
+    assert replacement is not None
+    assert replacement.reservation_id != original.reservation_id
+
+    tensor = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    coordinator._producer_pushes.bind_source("img", tensor, None)
+    coordinator._push_batch([record])
+    assert replacement.state is ConsumerReservationState.READY
+    assert replacement.allocation is not None
+    assert torch.equal(replacement.allocation.tensor, tensor)
+    assert not coordinator._producer_pushes.pending
+    assert record.spec.store is None  # Later refreshes must keep the P2P choice.
+
+
+@pytest.mark.cpu_test
+def test_unconfirmed_reader_retains_destination_owner(monkeypatch):
+    """An unsafe read/copy completion must keep its destination alive."""
+    import gc
+    import weakref
+
+    import torch
+
+    from tests.v1.ec_connector.unit.test_cross_encoder_cache import MemoryStore
+    from vllm.distributed.ec_transfer.ec_connector.mooncake import store_reader
+
+    # Captured exception arguments would themselves retain the reader frame.
+    monkeypatch.setattr(store_reader.logger, "disabled", True)
+
+    class UnconfirmedStore(MemoryStore):
+        def batch_get_into(self, *args):
+            raise RuntimeError("native completion is unknown")
+
+    client = MooncakeEmbeddingStoreClient(UnconfirmedStore(), read_buffer_bytes=1024)
+    reader = StoreDeliveryReader(
+        client,
+        device="cpu",
+        max_pending_items=1,
+        max_pending_bytes=1024,
+        read_buffer_bytes=1024,
+    )
+    destination = torch.empty(2, 2)
+    owner = weakref.ref(destination)
+    request = StoreReadRequest(
+        "unsafe",
+        "generation",
+        "img",
+        "namespace",
+        TensorSpec((2, 2), "torch.float32", 16),
+        destination,
+    )
+    assert reader.enqueue(request)
+    reader.shutdown(wait=True)
+    [completion] = reader.drain()
+    assert not completion.ok and not completion.safe
+    del request, destination
+    gc.collect()
+    assert owner() is not None

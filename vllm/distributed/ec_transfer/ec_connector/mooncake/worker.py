@@ -1183,14 +1183,6 @@ class ECMooncakeWorker:
         # A consumer that rejected Store delivery returns a normal P2P reservation.
         if all(shard.get("ready") or shard.get("cached") for shard in reservations):
             return "ready"
-        if all(
-            not shard.get("store_pending")
-            and not shard.get("ready")
-            and not shard.get("cancelled")
-            for shard in reservations
-        ):
-            return "failed_safe"
-
         remaining = [
             shard
             for shard in reservations
@@ -1202,6 +1194,10 @@ class ECMooncakeWorker:
                 return "timeout"
             still: list[dict[str, Any]] = []
             for shard in remaining:
+                if shard.get("write") and not shard.get("store_pending"):
+                    # Store admission was declined; this E owns the P2P write.
+                    safe_failure = True
+                    continue
                 addr = shard.get("addr")
                 if not isinstance(addr, str) or not addr:
                     return "failed"
@@ -1214,11 +1210,15 @@ class ECMooncakeWorker:
                     return "failed"
                 if not isinstance(status, dict):
                     return "failed"
+                if status.get("reservation_id") != shard.get("reservation_id"):
+                    return "failed"
                 if status.get("ready"):
                     shard["ready"] = True
                     shard["write"] = False
                     continue
                 if status.get("store_failed_safe"):
+                    shard["store_failed_safe"] = True
+                    shard["store_pending"] = False
                     safe_failure = True
                     continue
                 if status.get("error") and not status.get("store_pending"):
@@ -1239,23 +1239,21 @@ class ECMooncakeWorker:
         reservations: list[dict[str, Any]],
     ) -> bool:
         """Keep READY shards and allocate a fresh P2P generation for the rest."""
-        failed = [
-            shard
-            for shard in reservations
-            if not shard.get("ready") and not shard.get("cached")
-        ]
-        if failed:
-            try:
-                self._retry_cancel_reservations(record.spec, failed, record=record)
-            except Exception:
-                logger.warning(
-                    "Failed to settle Store reservations before P2P fallback "
-                    "for transfer_id=%s",
-                    record.spec.transfer_id,
-                    exc_info=True,
-                )
+        replacements: list[dict[str, Any]] = []
         try:
-            replacements = self._reserve_remote(replace(record.spec, store=None))
+            for shard in reservations:
+                if shard.get("cancelled"):
+                    return False
+                if shard.get("store_failed_safe"):
+                    # STORE_FAILED already settled its writer. A normal P2P
+                    # rejection still owns a usable reservation; cancelling it
+                    # would leave a CANCELLED tombstone for the same transfer.
+                    shard = self._reserve_one(
+                        str(shard["addr"]), replace(record.spec, store=None)
+                    )
+                    if shard.get("cancelled") or shard.get("store_pending"):
+                        return False
+                replacements.append(shard)
         except Exception:
             logger.warning(
                 "P2P fallback reservation failed for transfer_id=%s",
@@ -1263,6 +1261,7 @@ class ECMooncakeWorker:
                 exc_info=True,
             )
             return False
+        record.spec = replace(record.spec, store=None)
         self._producer_pushes.replace_reservations(record, replacements)
         return True
 
