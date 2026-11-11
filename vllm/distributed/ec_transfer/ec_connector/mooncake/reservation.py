@@ -33,6 +33,7 @@ class ConsumerReservationState(Enum):
     EXPIRE_PENDING = auto()
     CANCELLED = auto()
     EXPIRED = auto()
+    STORE_FAILED = auto()
 
 
 _ALLOWED_TRANSITIONS = {
@@ -41,18 +42,24 @@ _ALLOWED_TRANSITIONS = {
         ConsumerReservationState.CANCEL_PENDING,
         ConsumerReservationState.EXPIRE_PENDING,
         ConsumerReservationState.CANCELLED,
+        ConsumerReservationState.STORE_FAILED,
     },
     ConsumerReservationState.READY: {
         ConsumerReservationState.CANCELLED,
         ConsumerReservationState.EXPIRED,
     },
-    ConsumerReservationState.CANCEL_PENDING: {ConsumerReservationState.CANCELLED},
+    ConsumerReservationState.CANCEL_PENDING: {
+        ConsumerReservationState.CANCELLED,
+        ConsumerReservationState.STORE_FAILED,
+    },
     ConsumerReservationState.EXPIRE_PENDING: {
         ConsumerReservationState.CANCELLED,
         ConsumerReservationState.EXPIRED,
+        ConsumerReservationState.STORE_FAILED,
     },
     ConsumerReservationState.CANCELLED: set(),
     ConsumerReservationState.EXPIRED: set(),
+    ConsumerReservationState.STORE_FAILED: set(),
 }
 
 _ACTIVE_STATES = {
@@ -86,6 +93,9 @@ class ConsumerReservation:
     lease: ResidentLease[MemoryAllocation] | None = None
     expires_at: float = 0
     writer_id: str = ""
+    source: str = "p2p"
+    store_error: str | None = None
+    store_io_retained: bool = False
 
 
 class ConsumerReservationManager:
@@ -122,6 +132,7 @@ class ConsumerReservationManager:
         shape: tuple[int, ...],
         dtype_name: str,
         dtype: torch.dtype,
+        source: str = "p2p",
     ) -> tuple[ConsumerReservation | None, bool]:
         with self._condition:
             if self._shutting_down:
@@ -132,10 +143,10 @@ class ConsumerReservationManager:
                 and existing.state is ConsumerReservationState.CANCELLED
             ):
                 return existing, False
-            if (
-                existing is not None
-                and existing.state is ConsumerReservationState.EXPIRED
-            ):
+            if existing is not None and existing.state in {
+                ConsumerReservationState.EXPIRED,
+                ConsumerReservationState.STORE_FAILED,
+            }:
                 self._remove(transfer_id)
                 existing = None
             if (
@@ -191,6 +202,7 @@ class ConsumerReservationManager:
                     writer.allocation,
                     expires_at=now + self._lease_ttl,
                     writer_id=writer.transfer_id,
+                    source=writer.source,
                 )
                 self._insert(record)
                 self._followers.setdefault(writer.transfer_id, {})[transfer_id] = None
@@ -213,6 +225,7 @@ class ConsumerReservationManager:
                 allocation,
                 None,
                 now + self._lease_ttl,
+                source=source,
             )
             self._insert(record)
             self._writers[mm_hash] = record
@@ -221,7 +234,12 @@ class ConsumerReservationManager:
     def status(self, transfer_id: str) -> ConsumerReservation | None:
         with self._memory.lock:
             record = self._records.get(transfer_id)
-            if record is None or record.state not in _ACTIVE_STATES:
+            if record is None:
+                return None
+            if (
+                record.state not in _ACTIVE_STATES
+                and record.state is not ConsumerReservationState.STORE_FAILED
+            ):
                 return None
             return record
 
@@ -253,12 +271,81 @@ class ConsumerReservationManager:
             finally:
                 self._condition.notify_all()
 
+    def complete_store(
+        self,
+        transfer_id: str,
+        reservation_id: str,
+        *,
+        ok: bool,
+        safe: bool,
+        error: str | None = None,
+    ) -> tuple[bool, bool]:
+        """Finish a local Store writer. Late or mismatched generations are ignored."""
+        with self._condition:
+            try:
+                record = self._records.get(transfer_id)
+                if record is None or record.reservation_id != reservation_id:
+                    return False, False
+                if record.writer_id or record.source != "store":
+                    return False, False
+                if record.state is ConsumerReservationState.READY:
+                    return True, False
+                if record.state is ConsumerReservationState.STORE_FAILED:
+                    return True, False
+                if ok:
+                    return self._complete_locked(record)
+                record.store_error = error or "store get failed"
+                for follower in self._follower_records(record):
+                    follower.store_error = record.store_error
+                    follower.store_io_retained = not safe
+                if safe:
+                    for follower in self._follower_records(record):
+                        if follower.state in _ACTIVE_STATES:
+                            self._terminate(
+                                follower, ConsumerReservationState.STORE_FAILED
+                            )
+                    if record.state in _WRITER_OWNED_STATES:
+                        self._terminate(record, ConsumerReservationState.STORE_FAILED)
+                    return True, False
+                record.store_io_retained = True
+                return True, False
+            finally:
+                self._condition.notify_all()
+
+    def _complete_locked(self, record: ConsumerReservation) -> tuple[bool, bool]:
+        if record.state in _WRITER_OWNED_STATES:
+            self._publish_followers(record)
+        if record.state in _DEFERRED_STATES:
+            terminal = (
+                ConsumerReservationState.CANCELLED
+                if record.state is ConsumerReservationState.CANCEL_PENDING
+                else ConsumerReservationState.EXPIRED
+            )
+            self._terminate(record, terminal)
+            return True, False
+        if record.state is not ConsumerReservationState.WRITING:
+            return False, False
+        self._transition(record, ConsumerReservationState.READY)
+        record.expires_at = time.monotonic() + self._lease_ttl
+        return True, True
+
+    def _follower_records(
+        self, writer: ConsumerReservation
+    ) -> list[ConsumerReservation]:
+        return [
+            self._records[transfer_id]
+            for transfer_id in self._followers.get(writer.transfer_id, {})
+            if transfer_id in self._records
+        ]
+
     def _publish_followers(self, writer: ConsumerReservation) -> None:
+        # Always publish the completed writer into the resident cache, even
+        # when no follower is attached yet. Otherwise a later same-hash
+        # reserve after a fast Store GET would miss both the writer table and
+        # the cache and incorrectly start a new P2P write.
         if self._writers.get(writer.mm_hash) is writer:
             self._writers.pop(writer.mm_hash)
         followers = self._followers.pop(writer.transfer_id, {})
-        if not followers:
-            return
         assert writer.allocation is not None
         allocation = self._memory.publish(writer.mm_hash, writer.allocation, pin=False)
         for record in [writer, *(self._records[key] for key in followers)]:

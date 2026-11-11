@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 class ECConnector:
     """EC connector interface used by the V2 GPU model runner."""
 
+    @property
+    def remote_satisfied(self) -> set[str]:
+        return set()
+
     @contextmanager
     def maybe_get_output(
         self, scheduler_output: "SchedulerOutput"
@@ -45,6 +49,11 @@ class ActiveECConnector(ECConnector):
         # Every producer offloads freshly computed encoder outputs, including
         # an ec_both node that also reloads them.
         self.save_new_caches = self.ec_connector.is_producer
+        self._remote_satisfied: set[str] = set()
+
+    @property
+    def remote_satisfied(self) -> set[str]:
+        return set(self._remote_satisfied)
 
     @contextmanager
     def maybe_get_output(
@@ -61,6 +70,13 @@ class ActiveECConnector(ECConnector):
 
         if ec_connector.is_producer:
             ec_connector.start_save_caches(encoder_cache=self.encoder_cache)
+            take_remote = getattr(ec_connector, "take_remote_satisfied", None)
+            satisfied = take_remote() if callable(take_remote) else set()
+            self._remote_satisfied = (
+                set(satisfied) if isinstance(satisfied, (set, frozenset)) else set()
+            )
+        else:
+            self._remote_satisfied = set()
 
         if ec_connector.is_consumer:
             ec_connector.start_load_caches(self.encoder_cache)

@@ -93,6 +93,9 @@ class EncoderCacheManager:
         # mm_hash of mm_data => num_encoder_embeds of the mm_data
         self.freeable: OrderedDict[str, int] = OrderedDict()
         self.freed: list[str] = []
+        # Remote-only results: not reusable as later E-local cache hits.
+        self._nonresident: set[str] = set()
+        self._nonresident_budget_refunded: set[str] = set()
 
     def reset(self) -> None:
         """Reset the encoder cache to its initial state.
@@ -106,6 +109,8 @@ class EncoderCacheManager:
         self.request_hash_refs.clear()
         self.freeable.clear()
         self.freed.clear()
+        self._nonresident.clear()
+        self._nonresident_budget_refunded.clear()
         self.num_free_slots = self.cache_size
         self.num_freeable_slots = self.cache_size
 
@@ -126,8 +131,8 @@ class EncoderCacheManager:
 
         """
         mm_hash = request.mm_features[input_id].identifier
-        # Not cached at all
-        if mm_hash not in self.cached:
+        # Not cached at all, or only satisfied remotely in a prior step.
+        if mm_hash not in self.cached or mm_hash in self._nonresident:
             return False
 
         # Cached but currently not referenced by any request
@@ -222,6 +227,8 @@ class EncoderCacheManager:
         """
         mm_hash = request.mm_features[input_id].identifier
         request_id = request.request_id
+        if mm_hash in self._nonresident:
+            self._forget_nonresident_entry(mm_hash)
         if mm_hash not in self.cached:
             self.cached[mm_hash] = set()
 
@@ -294,9 +301,12 @@ class EncoderCacheManager:
             return
         self.cached[mm_hash].discard(req_id)
         if not self.cached[mm_hash]:
-            num_encoder_embeds = self.num_embeds_by_hash[mm_hash]
-            self.freeable[mm_hash] = num_encoder_embeds
-            self.num_freeable_slots += num_encoder_embeds
+            if mm_hash in self._nonresident:
+                self._forget_nonresident_entry(mm_hash)
+            else:
+                num_encoder_embeds = self.num_embeds_by_hash[mm_hash]
+                self.freeable[mm_hash] = num_encoder_embeds
+                self.num_freeable_slots += num_encoder_embeds
 
     def free(self, request: Request) -> None:
         """Free all encoder input cache reference held by *request*.
@@ -309,6 +319,44 @@ class EncoderCacheManager:
         """
         for input_id in list(self.get_cached_input_ids(request)):
             self.free_encoder_input(request, input_id)
+
+    def mark_nonresident(self, mm_hashes: set[str]) -> None:
+        """Mark remotely satisfied outputs as missing from the E-local cache.
+
+        The local-tensor budget is refunded immediately. Unreferenced entries
+        are discarded instead of being kept in the reusable LRU. Entries still
+        referenced by another request stay in the ref table but will not count
+        as local hits.
+        """
+        for mm_hash in mm_hashes:
+            if mm_hash not in self.cached:
+                continue
+            self._nonresident.add(mm_hash)
+            self._refund_nonresident_budget(mm_hash)
+            if not self.cached[mm_hash]:
+                self._forget_nonresident_entry(mm_hash)
+
+    def _refund_nonresident_budget(self, mm_hash: str) -> None:
+        if mm_hash in self._nonresident_budget_refunded:
+            return
+        num_encoder_embeds = self.num_embeds_by_hash.get(mm_hash, 0)
+        if mm_hash in self.freeable:
+            # Already counted as reclaimable; only convert it back into free
+            # slots, matching ordinary eviction.
+            self.freeable.pop(mm_hash)
+            self.num_free_slots += num_encoder_embeds
+        else:
+            self.num_free_slots += num_encoder_embeds
+            self.num_freeable_slots += num_encoder_embeds
+        self._nonresident_budget_refunded.add(mm_hash)
+
+    def _forget_nonresident_entry(self, mm_hash: str) -> None:
+        self._nonresident.discard(mm_hash)
+        self._nonresident_budget_refunded.discard(mm_hash)
+        self.num_embeds_by_hash.pop(mm_hash, None)
+        self.cached.pop(mm_hash, None)
+        if mm_hash not in self.freed:
+            self.freed.append(mm_hash)
 
     def get_freed_mm_hashes(self) -> list[str]:
         """Get and clear the list of recently freed encoder cache entries.

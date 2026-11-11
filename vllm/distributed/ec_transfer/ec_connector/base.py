@@ -277,6 +277,10 @@ class ECConnectorBase(ABC):
         """Prepare this step's outbound pushes before the model runs."""
         return
 
+    def take_remote_satisfied(self) -> set[str]:
+        """Producer inputs already delivered remotely in the current step."""
+        return set()
+
     def start_worker_services(self) -> None:
         """Start Worker-side services once the model is resident."""
         return
@@ -327,6 +331,10 @@ class ECConnectorBase(ABC):
 
         """
         return
+
+    def take_nonresident_outputs(self) -> set[str]:
+        """Encoder outputs satisfied remotely and not stored in the E cache."""
+        return set()
 
     def request_finished(
         self, request: "Request"

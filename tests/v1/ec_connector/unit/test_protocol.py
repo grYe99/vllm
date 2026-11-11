@@ -39,3 +39,46 @@ def test_compat_hash_deterministic_and_sensitive():
     c = compute_ec_compatibility_hash("0.1", "m", "float16", 128)
     assert a == b
     assert a != c
+
+
+def test_store_delivery_capability_constant_and_namespace_approval():
+    from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
+        StoreDeliverySpec,
+    )
+    from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (  # noqa: E501
+        STORE_DELIVERY_CAPABILITY,
+        TensorSpec,
+        store_namespace_is_approved,
+    )
+
+    assert STORE_DELIVERY_CAPABILITY == "store_delivery_v1"
+    namespace = (
+        "p@embedding@model:m@revision:r@encoder:e@dtype:torch.float32@protocol:v3"
+    )
+    spec = StoreDeliverySpec(
+        namespace=namespace,
+        identifier="img",
+        tensor_spec=TensorSpec((2, 2), "float32", 16),
+    )
+    assert spec.protocol == "v3"
+    assert store_namespace_is_approved(
+        namespace.replace("@encoder:e", "@encoder:other"), namespace
+    )
+
+
+def test_old_peer_without_capability_is_not_store_delivery():
+    from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (  # noqa: E501
+        STORE_DELIVERY_CAPABILITY,
+    )
+
+    old_peer: dict[str, object] = {"ports": [19100]}
+    new_peer: dict[str, object] = {
+        "ports": [19100, 19101],
+        "capabilities": [STORE_DELIVERY_CAPABILITY],
+    }
+    old_caps = old_peer.get("capabilities", [])
+    assert isinstance(old_caps, list)
+    assert STORE_DELIVERY_CAPABILITY not in old_caps
+    new_caps = new_peer["capabilities"]
+    assert isinstance(new_caps, list)
+    assert STORE_DELIVERY_CAPABILITY in new_caps

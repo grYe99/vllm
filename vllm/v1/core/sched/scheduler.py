@@ -2635,6 +2635,13 @@ class Scheduler(SchedulerInterface):
         # EC Connector: update state from worker-side EC connector output.
         if self.ec_connector is not None and ec_connector_output:
             self.ec_connector.update_connector_output(ec_connector_output)
+            nonresident = self.ec_connector.take_nonresident_outputs()
+            if nonresident:
+                mark_nonresident = getattr(
+                    self.encoder_cache_manager, "mark_nonresident", None
+                )
+                if callable(mark_nonresident):
+                    mark_nonresident(nonresident)
 
         # Worker-side KV connector stats from the model runner output.
         kv_connector_stats: KVConnectorStats | None = (

@@ -72,6 +72,7 @@ class ProducerPushRecord:
 _ALLOWED_TRANSITIONS = {
     ProducerPushState.WAITING_INPUTS: {
         ProducerPushState.WRITING,
+        ProducerPushState.DONE,
         ProducerPushState.CANCEL_PENDING,
         ProducerPushState.FAILED,
     },
@@ -274,6 +275,18 @@ class ProducerPushManager:
             for record in records:
                 self._transition(record, ProducerPushState.DONE)
                 self._release_source(record)
+
+    def complete_store_delivery(self, record: ProducerPushRecord) -> None:
+        """Terminalize a Store-delivered push that has no source tensor."""
+        with self._lock:
+            if record.state is ProducerPushState.DONE:
+                return
+            if record.source_tensor is not None:
+                raise RuntimeError(
+                    f"Producer push {record.spec.transfer_id!r} unexpectedly "
+                    "has a source tensor during Store completion"
+                )
+            self._transition(record, ProducerPushState.DONE)
 
     def fail(self, records: list[ProducerPushRecord], error: Exception) -> None:
         with self._lock:

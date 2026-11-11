@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for control-layer ABCs, ZmqClientConnection, and ECSession."""
 
+import socket
+import time
+from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,6 +12,31 @@ import zmq
 
 from vllm.distributed.ec_transfer.ec_connector.cpu.control.base import (
     ControlConnection,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
+    ConsumerControlServer,
+    ControlClient,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
+    MemoryAllocation,
+    ResidentLease,
+    _ResidentEntry,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.reservation import (
+    ConsumerReservationManager,
+    ConsumerReservationState,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.store_reader import (
+    StoreDeliveryReader,
+    StoreReadRequest,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (
+    STORE_DELIVERY_CAPABILITY,
+    TensorSpec,
+    make_embedding_key,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.store_client import (  # noqa: E501
+    MooncakeEmbeddingStoreClient,
 )
 
 
@@ -319,3 +347,538 @@ def test_zmq_server_rejects_an_occupied_explicit_port():
         assert exc.value.errno == zmq.EADDRINUSE
     finally:
         server.close()
+
+
+# ---------------------------------------------------------------------------
+# Mooncake hybrid Store-delivery control / reservation protocol
+# ---------------------------------------------------------------------------
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+class _FakeConsumerPool:
+    def __init__(self, capacity: int = 1 << 20) -> None:
+        self.lock = __import__("threading").RLock()
+        self._storage = __import__("torch").zeros(
+            capacity, dtype=__import__("torch").uint8
+        )
+        self._used = 0
+        self._cached: dict[str, MemoryAllocation] = {}
+
+    def try_allocate(self, nbytes, shape, dtype):
+        if self._used + nbytes > self._storage.numel():
+            return None
+        tensor = self._storage.narrow(0, self._used, nbytes).view(dtype).view(shape)
+        allocation = MemoryAllocation(self._used, nbytes, tensor)
+        self._used += nbytes
+        return allocation
+
+    def reclaim_and_allocate(self, nbytes, shape, dtype):
+        return self.try_allocate(nbytes, shape, dtype)
+
+    def acquire_cached(self, mm_hash, shape, dtype):
+        allocation = self._cached.get(mm_hash)
+        if allocation is None:
+            return None
+        if (
+            tuple(allocation.tensor.shape) != tuple(shape)
+            or allocation.tensor.dtype != dtype
+        ):
+            return None
+        return ResidentLease(mm_hash, _ResidentEntry(allocation))
+
+    def publish(self, mm_hash, allocation, lease=None, pin=False):
+        self._cached[mm_hash] = allocation
+        return allocation
+
+    def release_cached(self, lease):
+        return None
+
+    def free(self, allocation):
+        return None
+
+    def retire_stale(self, encoder_cache, freed=None):
+        return None
+
+
+def _store_client_with(objects: dict[str, "object"] | None = None):
+    from tests.v1.ec_connector.unit.test_cross_encoder_cache import MemoryStore
+
+    native = MemoryStore()
+    if objects:
+        native.objects.update(objects)
+    return MooncakeEmbeddingStoreClient(native, read_buffer_bytes=1024), native
+
+
+@dataclass
+class _StoreHarness:
+    reservations: ConsumerReservationManager
+    reader: StoreDeliveryReader
+    server: ConsumerControlServer
+    client: ControlClient
+    addr: str
+    pool: _FakeConsumerPool
+    store: object
+    namespace: str
+
+    def close(self) -> None:
+        self.reader.shutdown(wait=True)
+        self.server.close()
+        self.client.close()
+
+
+def _make_store_control_harness(*, max_pending_items: int = 8) -> _StoreHarness:
+    import torch
+
+    namespace = (
+        "test@embedding@model:model@revision:revision"
+        "@encoder:encoder@dtype:torch.float32@protocol:v3"
+    )
+    pool = _FakeConsumerPool()
+    reservations = ConsumerReservationManager(pool, lease_ttl=30, tombstone_limit=16)
+    client, native = _store_client_with()
+    reader = StoreDeliveryReader(
+        client,
+        device="cpu",
+        max_pending_items=max_pending_items,
+        max_pending_bytes=1 << 20,
+        read_buffer_bytes=1024,
+    )
+
+    def reserve(payload):
+        transfer_id = str(payload["transfer_id"])
+        mm_hash = str(payload["mm_hash"])
+        nbytes = int(payload["nbytes"])
+        shape = tuple(int(v) for v in payload["shape"])
+        dtype_name = str(payload["dtype"]).removeprefix("torch.")
+        dtype = getattr(torch, dtype_name)
+        source = "store" if payload.get("store") and reader.can_admit(nbytes) else "p2p"
+        record, should_write = reservations.reserve(
+            transfer_id, mm_hash, nbytes, shape, dtype_name, dtype, source=source
+        )
+        if record is None:
+            raise RuntimeError("pool full")
+        if record.allocation is None:
+            raise RuntimeError("reservation has no allocation")
+        store_pending = False
+        if (
+            should_write
+            and source == "store"
+            and record.state is ConsumerReservationState.WRITING
+        ):
+            store = payload["store"]
+            admitted = reader.enqueue(
+                StoreReadRequest(
+                    transfer_id=transfer_id,
+                    reservation_id=record.reservation_id,
+                    mm_hash=mm_hash,
+                    namespace=str(store["namespace"]),
+                    tensor_spec=TensorSpec(
+                        tuple(int(v) for v in store["shape"]),
+                        (
+                            str(store["dtype"])
+                            if str(store["dtype"]).startswith("torch.")
+                            else "torch." + str(store["dtype"])
+                        ),
+                        int(store["nbytes"]),
+                    ),
+                    destination=record.allocation.tensor,
+                )
+            )
+            store_pending = admitted
+            if not admitted:
+                record.source = "p2p"
+        elif (
+            record.source == "store"
+            and record.state is ConsumerReservationState.WRITING
+        ):
+            store_pending = record.store_error is None
+        return {
+            "reservation_id": record.reservation_id,
+            "dst_session": "local",
+            "dst_ptr": record.allocation.tensor.data_ptr(),
+            "nbytes": record.allocation.tensor.nbytes,
+            "write": should_write and record.source != "store",
+            "ready": record.state is ConsumerReservationState.READY,
+            "cached": record.lease is not None,
+            "store_pending": store_pending,
+        }
+
+    def status(transfer_id: str):
+        record = reservations.status(transfer_id)
+        if record is None:
+            return None
+        return {
+            "mm_hash": record.mm_hash,
+            "ready": record.state is ConsumerReservationState.READY,
+            "reservation_id": record.reservation_id,
+            "store_pending": (
+                record.source == "store"
+                and record.state is ConsumerReservationState.WRITING
+                and record.store_error is None
+            ),
+            "store_failed_safe": record.state is ConsumerReservationState.STORE_FAILED,
+            "error": record.store_error,
+        }
+
+    def poll_store():
+        ready = []
+        for completion in reader.drain():
+            accepted, became_ready = reservations.complete_store(
+                completion.transfer_id,
+                completion.reservation_id,
+                ok=completion.ok,
+                safe=completion.safe,
+                error=completion.error,
+            )
+            if became_ready:
+                ready.append(completion.transfer_id)
+            ready.extend(reservations.drain_ready())
+        return ready
+
+    port = _free_loopback_port()
+    server = ConsumerControlServer(
+        "127.0.0.1",
+        port,
+        reserve,
+        status,
+        reservations.complete,
+        reservations.cancel,
+        reservations.expire,
+        peer_ports=[port],
+        device=None,
+        drain_ready=reservations.drain_ready,
+        poll_store=poll_store,
+        capabilities=[STORE_DELIVERY_CAPABILITY],
+    )
+    server.start()
+    control = ControlClient(timeout_ms=2000)
+    addr = f"tcp://127.0.0.1:{port}"
+    return _StoreHarness(
+        reservations, reader, server, control, addr, pool, native, namespace
+    )
+
+
+def _store_item(harness: _StoreHarness, transfer_id: str, mm_hash: str = "img"):
+    return {
+        "transfer_id": transfer_id,
+        "mm_hash": mm_hash,
+        "nbytes": 16,
+        "shape": [2, 2],
+        "dtype": "float32",
+        "store": {
+            "namespace": harness.namespace,
+            "identifier": mm_hash,
+            "protocol": "v3",
+            "shape": [2, 2],
+            "dtype": "torch.float32",
+            "nbytes": 16,
+        },
+    }
+
+
+def _wait_ready(harness: _StoreHarness, transfer_id: str, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = harness.client.request(
+            harness.addr, {"op": "status", "transfer_id": transfer_id}
+        )
+        if status and status.get("ready"):
+            return status
+        if status and status.get("store_failed_safe"):
+            return status
+        if status and status.get("error") and not status.get("store_pending"):
+            return status
+        time.sleep(0.01)
+    raise TimeoutError(f"timed out waiting for {transfer_id}")
+
+
+def test_store_delivery_reader_runs_before_inference():
+    """The P reader can finish a Store GET before any inference request exists."""
+    import torch
+
+    harness = _make_store_control_harness()
+    try:
+        peers = harness.client.request(harness.addr, {"op": "peers"})
+        assert STORE_DELIVERY_CAPABILITY in peers["capabilities"]
+        tensor = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        client = harness.reader._client
+        client.put_tensor(make_embedding_key(harness.namespace, "img"), tensor)
+        reserved = harness.client.request(
+            harness.addr, {"op": "reserve", **_store_item(harness, "t1")}
+        )
+        assert reserved["store_pending"] is True
+        assert reserved["ready"] is False
+        assert reserved["write"] is False
+        status = _wait_ready(harness, "t1")
+        assert status["ready"] is True
+        record = harness.reservations.status("t1")
+        assert record is not None
+        assert record.allocation is not None
+        assert torch.equal(record.allocation.tensor.cpu(), tensor)
+    finally:
+        harness.close()
+
+
+def test_old_peer_peers_payload_omits_capability_when_disabled():
+    port = _free_loopback_port()
+    server = ConsumerControlServer(
+        "127.0.0.1",
+        port,
+        lambda payload: {"reservation_id": "x", "ready": False, "write": True},
+        lambda transfer_id: None,
+        lambda transfer_id, reservation_id: (False, False),
+        lambda *args: True,
+        lambda: 0,
+        peer_ports=[port],
+    )
+    client = ControlClient(timeout_ms=2000)
+    try:
+        server.start()
+        addr = f"tcp://127.0.0.1:{port}"
+        peers = client.request(addr, {"op": "peers"})
+        assert "capabilities" not in peers
+        assert client.consumer_capabilities(addr) == frozenset()
+    finally:
+        server.close()
+        client.close()
+
+
+def test_store_pending_then_ready_and_late_generation_is_ignored():
+    import torch
+
+    harness = _make_store_control_harness()
+    try:
+        tensor = torch.ones(2, 2)
+        harness.reader._client.put_tensor(
+            make_embedding_key(harness.namespace, "img"), tensor
+        )
+        first = harness.client.request(
+            harness.addr, {"op": "reserve", **_store_item(harness, "t-gen")}
+        )
+        first_id = first["reservation_id"]
+        status = _wait_ready(harness, "t-gen")
+        assert status["ready"] is True
+        # A late completion tagged with a stale reservation id must not apply.
+        accepted, became_ready = harness.reservations.complete_store(
+            "t-gen", "stale-generation", ok=True, safe=True
+        )
+        assert accepted is False
+        assert became_ready is False
+        later = harness.reservations.status("t-gen")
+        assert later is not None
+        assert first_id == later.reservation_id
+    finally:
+        harness.close()
+
+
+def test_same_key_store_and_p2p_share_a_single_writer():
+    import torch
+
+    harness = _make_store_control_harness()
+    try:
+        tensor = torch.full((2, 2), 5.0)
+        harness.reader._client.put_tensor(
+            make_embedding_key(harness.namespace, "img"), tensor
+        )
+        writer = harness.client.request(
+            harness.addr, {"op": "reserve", **_store_item(harness, "writer")}
+        )
+        follower = harness.client.request(
+            harness.addr,
+            {
+                "op": "reserve",
+                "transfer_id": "follower",
+                "mm_hash": "img",
+                "nbytes": 16,
+                "shape": [2, 2],
+                "dtype": "float32",
+            },
+        )
+        assert writer["write"] is False
+        assert follower["write"] is False
+        # The follower either joins the in-flight Store writer or hits the
+        # cache if that writer already completed.
+        if follower.get("ready"):
+            assert follower["store_pending"] is not True
+        else:
+            assert follower["store_pending"] is True
+            assert _wait_ready(harness, "follower")["ready"] is True
+        assert _wait_ready(harness, "writer")["ready"] is True
+        # A later same-hash reserve must be a cache hit, not a new P2P writer.
+        later = harness.client.request(
+            harness.addr,
+            {
+                "op": "reserve",
+                "transfer_id": "later",
+                "mm_hash": "img",
+                "nbytes": 16,
+                "shape": [2, 2],
+                "dtype": "float32",
+            },
+        )
+        assert later["write"] is False
+        assert later["ready"] is True
+    finally:
+        harness.close()
+
+
+def test_store_reader_backpressure_rejects_excess_work_without_blocking_rep():
+    import torch
+
+    harness = _make_store_control_harness(max_pending_items=1)
+    try:
+        # Pause the reader so the first job occupies the only slot.
+        started = __import__("threading").Event()
+        release = __import__("threading").Event()
+        original = harness.reader._run
+
+        def blocked(request):
+            started.set()
+            assert release.wait(timeout=5)
+            return original(request)
+
+        harness.reader._run = blocked  # type: ignore[method-assign]
+        harness.reader._client.put_tensor(
+            make_embedding_key(harness.namespace, "img"), torch.ones(2, 2)
+        )
+        first = harness.client.request(
+            harness.addr, {"op": "reserve", **_store_item(harness, "t1", "img")}
+        )
+        assert first["store_pending"] is True
+        assert started.wait(timeout=5)
+        # A second unique key cannot be admitted as a Store writer. The REP
+        # loop must still answer immediately with a normal P2P reservation.
+        second = harness.client.request(
+            harness.addr, {"op": "reserve", **_store_item(harness, "t2", "other")}
+        )
+        assert second["store_pending"] is False
+        assert second["write"] is True
+    finally:
+        release.set()
+        harness.close()
+
+
+def test_recoverable_store_failure_marks_store_failed_safe():
+    harness = _make_store_control_harness()
+    try:
+        reserved = harness.client.request(
+            harness.addr, {"op": "reserve", **_store_item(harness, "missing")}
+        )
+        assert reserved["store_pending"] is True
+        status = _wait_ready(harness, "missing")
+        assert status["store_failed_safe"] is True
+        assert status["ready"] is not True
+        # The same transfer id can be reserved again for P2P fallback.
+        retry = harness.client.request(
+            harness.addr,
+            {
+                "op": "reserve",
+                "transfer_id": "missing",
+                "mm_hash": "img",
+                "nbytes": 16,
+                "shape": [2, 2],
+                "dtype": "float32",
+            },
+        )
+        assert retry["reservation_id"]
+        assert retry["reservation_id"] != reserved["reservation_id"]
+        assert retry["write"] is True
+    finally:
+        harness.close()
+
+
+def test_unconfirmed_store_io_retains_owners():
+    harness = _make_store_control_harness()
+    try:
+        record, should_write = harness.reservations.reserve(
+            "unsafe",
+            "img",
+            16,
+            (2, 2),
+            "float32",
+            __import__("torch").float32,
+            source="store",
+        )
+        assert should_write
+        assert record is not None
+        assert record.allocation is not None
+        allocation = record.allocation
+        accepted, became_ready = harness.reservations.complete_store(
+            "unsafe",
+            record.reservation_id,
+            ok=False,
+            safe=False,
+            error="native i/o still running",
+        )
+        assert accepted is True
+        assert became_ready is False
+        assert record.state is ConsumerReservationState.WRITING
+        assert record.store_io_retained is True
+        assert record.allocation is allocation
+        status = harness.reservations.status("unsafe")
+        assert status is not None
+        assert status.store_error
+    finally:
+        harness.close()
+
+
+def test_store_reader_enqueue_does_not_deadlock_when_job_already_finished():
+    """A finished future must not re-enter the admission lock from enqueue."""
+    from concurrent.futures import Future
+
+    import torch
+
+    client, _native = _store_client_with()
+    namespace = (
+        "test@embedding@model:model@revision:revision"
+        "@encoder:encoder@dtype:torch.float32@protocol:v3"
+    )
+    reader = StoreDeliveryReader(
+        client,
+        device="cpu",
+        max_pending_items=8,
+        max_pending_bytes=1 << 20,
+        read_buffer_bytes=1024,
+    )
+    original = reader._executor
+
+    class _ImmediateExecutor:
+        def submit(self, fn, *args, **kwargs):
+            future: Future[None] = Future()
+            try:
+                fn(*args, **kwargs)
+                future.set_result(None)
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    try:
+        client.put_tensor(make_embedding_key(namespace, "img"), torch.ones(2, 2))
+        reader._executor = _ImmediateExecutor()
+        destination = torch.empty(2, 2)
+        admitted = reader.enqueue(
+            StoreReadRequest(
+                transfer_id="sync",
+                reservation_id="rid",
+                mm_hash="img",
+                namespace=namespace,
+                tensor_spec=TensorSpec((2, 2), "torch.float32", 16),
+                destination=destination,
+            )
+        )
+        assert admitted is True
+        completions = reader.drain()
+        assert len(completions) == 1
+        assert completions[0].ok is True
+        assert torch.equal(destination, torch.ones(2, 2))
+    finally:
+        reader._executor = original
+        reader.shutdown(wait=True)

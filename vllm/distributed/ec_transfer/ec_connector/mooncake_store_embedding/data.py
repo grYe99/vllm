@@ -49,3 +49,51 @@ def build_embedding_namespace(vllm_config: VllmConfig) -> str:
         f"@dtype:{model_config.dtype}"
         f"@protocol:{EMBEDDING_CACHE_KEY_VERSION}"
     )
+
+
+STORE_DELIVERY_CAPABILITY = "store_delivery_v1"
+
+
+def parse_embedding_namespace(namespace: str) -> dict[str, str] | None:
+    """Split a ``protocol:v3`` embedding namespace into its published fields."""
+    marker = "embedding@model:"
+    if marker in namespace:
+        prefix, rest = namespace.split(marker, 1)
+        if prefix.endswith("@"):
+            prefix = prefix[:-1]
+        rest = marker + rest
+    else:
+        return None
+    fields: dict[str, str] = {"prefix": prefix}
+    # rest = embedding@model:X@revision:Y@encoder:Z@dtype:W@protocol:V
+    expected = ("model", "revision", "encoder", "dtype", "protocol")
+    cursor = rest[len("embedding@") :]
+    parts = cursor.split("@")
+    if len(parts) != len(expected):
+        return None
+    for part, name in zip(parts, expected, strict=True):
+        key, sep, value = part.partition(":")
+        if sep != ":" or key != name or not value:
+            return None
+        fields[name] = value
+    return fields
+
+
+def store_namespace_is_approved(received: str, approved: str) -> bool:
+    """Accept E's namespace if model/revision/prefix/protocol match this deployment.
+
+    Encoder multimodal hashes may differ between E-only and PD instances, so
+    the received encoder field is not compared. The key is used verbatim after
+    this check; it is not rebuilt from the consumer config.
+    """
+    rec = parse_embedding_namespace(received)
+    appr = parse_embedding_namespace(approved)
+    if rec is None or appr is None:
+        return False
+    return (
+        rec["prefix"] == appr["prefix"]
+        and rec["model"] == appr["model"]
+        and rec["revision"] == appr["revision"]
+        and rec["protocol"] == appr["protocol"] == EMBEDDING_CACHE_KEY_VERSION
+        and rec["dtype"] == appr["dtype"]
+    )

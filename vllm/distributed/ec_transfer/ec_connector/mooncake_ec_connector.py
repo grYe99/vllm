@@ -56,6 +56,10 @@ class ECMooncakeConnector(ECConnectorBase):
         assert isinstance(metadata, ECMooncakeConnectorMetadata)
         self._worker.start_save_caches(metadata, **kwargs)
 
+    def take_remote_satisfied(self) -> set[str]:
+        assert self._worker is not None
+        return self._worker.take_remote_satisfied()
+
     def start_load_caches(
         self, encoder_cache: dict[str, torch.Tensor], **kwargs: Any
     ) -> None:
@@ -111,6 +115,10 @@ class ECMooncakeConnector(ECConnectorBase):
     def update_connector_output(self, connector_output: ECConnectorOutput) -> None:
         assert self._scheduler is not None
         self._scheduler.update_connector_output(connector_output)
+
+    def take_nonresident_outputs(self) -> set[str]:
+        assert self._scheduler is not None
+        return self._scheduler.take_nonresident_outputs()
 
     def has_pending_push_work(self) -> bool:
         assert self._scheduler is not None

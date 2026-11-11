@@ -471,3 +471,54 @@ def test_consumed_cpu_input_releases_storage_before_request_finishes():
     cache.update_encoder_inputs("a", {0: None})
     assert ref() is None
     assert "a" in cache.mm_features
+
+
+def test_prepare_mm_inputs_skips_remote_satisfied_identifiers():
+    """Remotely delivered inputs are skipped without inserting a local tensor."""
+    from vllm.multimodal.inputs import MultiModalKwargsItem
+
+    features = [
+        MultiModalFeatureSpec(
+            data=MultiModalKwargsItem({}),
+            modality="image",
+            identifier="remote",
+            mm_position=PlaceholderRange(offset=0, length=2),
+        ),
+        MultiModalFeatureSpec(
+            data=MultiModalKwargsItem({}),
+            modality="image",
+            identifier="compute",
+            mm_position=PlaceholderRange(offset=2, length=2),
+        ),
+    ]
+    runner = _make_runner(features, cached=[])
+    hashes, kwargs = runner.prepare_mm_inputs(
+        {"req0": [0, 1]}, skip_identifiers={"remote"}
+    )
+    assert hashes == ["compute"]
+    assert len(kwargs) == 1
+    assert "remote" not in runner.encoder_cache.encoder_outputs
+    assert "compute" not in runner.encoder_cache.encoder_outputs
+
+
+def test_prepare_mm_inputs_prefers_real_resident_tensor_over_skip():
+    from vllm.multimodal.inputs import MultiModalKwargsItem
+
+    cached = MultiModalFeatureSpec(
+        data=MultiModalKwargsItem({}),
+        modality="image",
+        identifier="shared",
+        mm_position=PlaceholderRange(offset=0, length=2),
+    )
+    pending = MultiModalFeatureSpec(
+        data=MultiModalKwargsItem({}),
+        modality="image",
+        identifier="other",
+        mm_position=PlaceholderRange(offset=2, length=2),
+    )
+    runner = _make_runner([cached, pending], cached=[cached])
+    hashes, _ = runner.prepare_mm_inputs(
+        {"req0": [0, 1]}, skip_identifiers={"shared", "other"}
+    )
+    assert hashes == []
+    assert "shared" in runner.encoder_cache.encoder_outputs

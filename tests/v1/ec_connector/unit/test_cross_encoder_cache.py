@@ -32,7 +32,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding import (
 from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding import (
     store_client,
 )
-from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (
+from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (  # noqa: E501
     TensorSpec,
     build_embedding_namespace,
     make_embedding_key,
@@ -756,3 +756,89 @@ def test_readiness_and_shutdown_do_not_block_p2p_completion(backend, monkeypatch
     assert backend.store_client.store.objects[make_embedding_key(KEY, "a")][
         24:
     ] == struct.pack("<4f", 0, 1, 2, 3)
+
+
+def test_prefill_store_delivery_requires_cross_encoder_cache_on_encoder():
+    config = create_ec_vllm_config(ec_role="ec_producer")
+    config.ec_transfer_config.ec_connector = "ECMooncakeConnector"
+    config.ec_transfer_config.ec_connector_extra_config["prefill_store_delivery"] = True
+    config.ec_transfer_config.ec_connector_extra_config["cross_encoder_cache"] = False
+    config.use_v2_model_runner = True
+    config.lora_config = None
+    config.model_config.multimodal_config = MultiModalConfig(mm_processor_cache_gb=1)
+    with pytest.raises(ValueError, match="cross_encoder_cache=true"):
+        MooncakeECConfig.from_vllm_config(config)
+
+
+def test_prefill_store_delivery_enables_reader_on_prefill_without_producer_flag():
+    config = create_ec_vllm_config(ec_role="ec_consumer")
+    config.ec_transfer_config.ec_connector = "ECMooncakeConnector"
+    config.ec_transfer_config.ec_connector_extra_config["prefill_store_delivery"] = True
+    config.use_v2_model_runner = True
+    config.lora_config = None
+    parsed = MooncakeECConfig.from_vllm_config(config)
+    assert parsed.prefill_store_delivery is True
+    assert parsed.cross_encoder_cache is False
+
+
+def test_prefill_store_delivery_defaults_off():
+    config = create_ec_vllm_config(ec_role="ec_producer")
+    config.ec_transfer_config.ec_connector = "ECMooncakeConnector"
+    config.use_v2_model_runner = True
+    config.lora_config = None
+    parsed = MooncakeECConfig.from_vllm_config(config)
+    assert parsed.prefill_store_delivery is False
+
+
+def test_lookup_hits_do_not_load_or_insert(backend):
+    """Lookup-only hits must not GET payloads or write the encoder cache."""
+    backend.store_client.put_tensor(
+        make_embedding_key(KEY, "a"), torch.full((2, 2), 3.0)
+    )
+    original = backend.store_client.load_tensors
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("lookup_hits must not call load_tensors")
+
+    backend.store_client.load_tensors = forbidden
+    cache: dict[str, torch.Tensor] = {}
+    hits = backend.lookup_hits({"a": SPEC, "b": SPEC}, cache)
+    assert set(hits) == {"a"}
+    assert hits["a"].namespace == KEY
+    assert hits["a"].pool_key == make_embedding_key(KEY, "a")
+    assert cache == {}
+    backend.store_client.load_tensors = original
+    # Default relay still loads through resolve_inputs.
+    loaded = backend.resolve_inputs({"a": SPEC}, cache, "cpu")
+    assert loaded == {"a"}
+    assert torch.equal(cache["a"], torch.full((2, 2), 3.0))
+
+
+def test_lookup_hits_skip_local_cache_entries(backend):
+    backend.store_client.put_tensor(
+        make_embedding_key(KEY, "a"), torch.full((2, 2), 1.0)
+    )
+    local = torch.full((2, 2), 9.0)
+    cache = {"a": local}
+    assert backend.lookup_hits({"a": SPEC}, cache) == {}
+    assert cache["a"] is local
+
+
+def test_namespace_is_transported_verbatim_and_ignores_encoder_hash():
+    from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (  # noqa: E501
+        parse_embedding_namespace,
+        store_namespace_is_approved,
+    )
+
+    received = (
+        "team@cache@embedding@model:shared/model@revision:rev:1"
+        "@encoder:e-only-hash@dtype:torch.float32@protocol:v3"
+    )
+    approved = received.replace("@encoder:e-only-hash", "@encoder:pd-hash")
+    assert store_namespace_is_approved(received, approved)
+    parsed = parse_embedding_namespace(received)
+    assert parsed is not None
+    assert parsed["encoder"] == "e-only-hash"
+    assert not store_namespace_is_approved(
+        received.replace("@protocol:v3", "@protocol:v2"), approved
+    )

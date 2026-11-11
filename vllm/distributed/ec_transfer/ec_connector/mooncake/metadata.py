@@ -29,6 +29,16 @@ class ECMooncakeLoadSpec:
     local: bool = False
 
 
+@dataclass(frozen=True)
+class StoreDeliverySpec:
+    """E-derived Store object contract for one transfer destination."""
+
+    namespace: str
+    identifier: str
+    tensor_spec: TensorSpec
+    protocol: str = "v3"
+
+
 @dataclass
 class ECMooncakePushSpec:
     """Describe a destination reservation prepared before a tensor is ready."""
@@ -40,6 +50,7 @@ class ECMooncakePushSpec:
     consumer_zmq: str
     transfer_id: str
     request_id: str = ""
+    store: StoreDeliverySpec | None = None
 
 
 @dataclass
@@ -63,6 +74,9 @@ class ECMooncakeWorkerMetadata(ECConnectorWorkerMetadata):
     reclaimed: set[str] = field(default_factory=set)
     pending_saves: bool = False
     failed_saves: set[str] = field(default_factory=set)
+    # Encoder outputs satisfied by a remote Store GET. They are not E-local
+    # tensors and must not be treated as scheduler cache hits later.
+    nonresident: set[str] = field(default_factory=set)
 
     def aggregate(self, other: ECConnectorWorkerMetadata) -> ECMooncakeWorkerMetadata:
         assert isinstance(other, ECMooncakeWorkerMetadata)
@@ -76,4 +90,5 @@ class ECMooncakeWorkerMetadata(ECConnectorWorkerMetadata):
             reclaimed=self.reclaimed | other.reclaimed,
             pending_saves=self.pending_saves or other.pending_saves,
             failed_saves=self.failed_saves | other.failed_saves,
+            nonresident=self.nonresident | other.nonresident,
         )

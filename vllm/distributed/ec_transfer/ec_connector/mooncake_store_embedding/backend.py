@@ -24,6 +24,16 @@ from .store_client import (
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class StoreHitDescriptor:
+    """Lookup-only Store existence result; no payload has been loaded."""
+
+    identifier: str
+    pool_key: str
+    namespace: str
+    tensor_spec: TensorSpec
+
+
 @dataclass
 class _StoreSave:
     tensor: torch.Tensor | None
@@ -62,23 +72,25 @@ class MooncakeEmbeddingStoreBackend:
         self._closed = False
         self._fatal_error: BaseException | None = None
 
+    def set_step_candidates(self, identifiers: set[str]) -> None:
+        self._step_candidates = set(identifiers)
+
     def save_output(self, identifier: str, tensor: torch.Tensor) -> None:
         if identifier in self._step_candidates:
             self.reap()
             self._enqueue_save(identifier, tensor)
 
-    def resolve_inputs(
+    def lookup_hits(
         self,
         expected_tensors: Mapping[str, TensorSpec],
-        encoder_cache: dict[str, torch.Tensor],
-        device: torch.device | str,
-    ) -> set[str]:
-        """Load outputs before encoding; unresolved items retain normal computation."""
+        encoder_cache: Mapping[str, torch.Tensor],
+    ) -> dict[str, StoreHitDescriptor]:
+        """Return Store existence hits without GET or encoder-cache insertion."""
         self.reap()
         self._step_candidates = set(expected_tensors)
         candidates = [key for key in expected_tensors if key not in encoder_cache]
         if not candidates:
-            return set()
+            return {}
 
         pool_keys = [
             make_embedding_key(self.namespace, identifier) for identifier in candidates
@@ -90,17 +102,34 @@ class MooncakeEmbeddingStoreBackend:
                 "Mooncake embedding Store lookup failed; falling back to encoder",
                 exc_info=True,
             )
-            return set()
+            return {}
 
-        hits = {
-            pool_key: expected_tensors[identifier]
-            for identifier, pool_key, hit in zip(
-                candidates, pool_keys, exists, strict=True
-            )
-            if hit
-        }
+        hits: dict[str, StoreHitDescriptor] = {}
+        for identifier, pool_key, hit in zip(
+            candidates, pool_keys, exists, strict=True
+        ):
+            if hit:
+                hits[identifier] = StoreHitDescriptor(
+                    identifier=identifier,
+                    pool_key=pool_key,
+                    namespace=self.namespace,
+                    tensor_spec=expected_tensors[identifier],
+                )
+        return hits
+
+    def resolve_inputs(
+        self,
+        expected_tensors: Mapping[str, TensorSpec],
+        encoder_cache: dict[str, torch.Tensor],
+        device: torch.device | str,
+    ) -> set[str]:
+        """Load outputs before encoding; unresolved items retain normal computation."""
+        hits = self.lookup_hits(expected_tensors, encoder_cache)
+        if not hits:
+            return set()
+        contracts = {desc.pool_key: desc.tensor_spec for desc in hits.values()}
         try:
-            tensors = self.store_client.load_tensors(hits, device)
+            tensors = self.store_client.load_tensors(contracts, device)
         except (EmbeddingStoreOperationError, OSError):
             logger.warning(
                 "Mooncake embedding Store GET failed; falling back to encoder",
@@ -108,9 +137,9 @@ class MooncakeEmbeddingStoreBackend:
             )
             return set()
         loaded: set[str] = set()
-        for identifier, pool_key in zip(candidates, pool_keys, strict=True):
-            if pool_key in tensors:
-                encoder_cache[identifier] = tensors[pool_key]
+        for identifier, desc in hits.items():
+            if desc.pool_key in tensors:
+                encoder_cache[identifier] = tensors[desc.pool_key]
                 loaded.add(identifier)
         return loaded
 

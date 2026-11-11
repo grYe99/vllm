@@ -70,6 +70,7 @@ class MooncakeECConfig:
     push_wait_timeout_s: float
     pool_size: int
     cross_encoder_cache: bool = False
+    prefill_store_delivery: bool = False
     store_max_pending_items: int = 32
     store_max_pending_bytes: int = 2 * 1024**3
     store_read_buffer_bytes: int = 128 * 1024**2
@@ -116,6 +117,17 @@ class MooncakeECConfig:
                     "cross_encoder_cache requires mm_processor_cache_gb > 0 "
                     "to preserve content identifiers across Encoders and restarts"
                 )
+        prefill_store_delivery = get("prefill_store_delivery", False)
+        if not isinstance(prefill_store_delivery, bool):
+            raise ValueError("prefill_store_delivery must be a boolean")
+        if prefill_store_delivery:
+            if not vllm_config.use_v2_model_runner:
+                raise ValueError("prefill_store_delivery requires Model Runner V2")
+            if ec_config.is_ec_producer and not shared_reuse:
+                raise ValueError(
+                    "prefill_store_delivery requires cross_encoder_cache=true "
+                    "on the Encoder"
+                )
         control_port = int(ec_config.ec_port) + (
             parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
         )
@@ -143,6 +155,7 @@ class MooncakeECConfig:
             ),
             pool_size=registered_buffer_size,
             cross_encoder_cache=shared_reuse,
+            prefill_store_delivery=prefill_store_delivery,
             store_max_pending_items=_positive_int(
                 "store_max_pending_items", get("store_max_pending_items", 32)
             ),
