@@ -788,6 +788,37 @@ def test_prefill_store_delivery_defaults_off():
     config.lora_config = None
     parsed = MooncakeECConfig.from_vllm_config(config)
     assert parsed.prefill_store_delivery is False
+    assert parsed.prefill_store_delivery_wait_ready is False
+
+
+def test_prefill_store_delivery_wait_ready_can_be_enabled():
+    config = create_ec_vllm_config(ec_role="ec_producer")
+    config.ec_transfer_config.ec_connector = "ECMooncakeConnector"
+    config.ec_transfer_config.ec_connector_extra_config["prefill_store_delivery"] = True
+    config.ec_transfer_config.ec_connector_extra_config["cross_encoder_cache"] = True
+    config.ec_transfer_config.ec_connector_extra_config[
+        "prefill_store_delivery_wait_ready"
+    ] = True
+    config.use_v2_model_runner = True
+    config.lora_config = None
+    config.scheduler_config.async_scheduling = False
+    parsed = MooncakeECConfig.from_vllm_config(config)
+    assert parsed.prefill_store_delivery is True
+    assert parsed.prefill_store_delivery_wait_ready is True
+
+
+def test_prefill_store_delivery_wait_ready_requires_bool():
+    config = create_ec_vllm_config(ec_role="ec_producer")
+    config.ec_transfer_config.ec_connector = "ECMooncakeConnector"
+    config.ec_transfer_config.ec_connector_extra_config[
+        "prefill_store_delivery_wait_ready"
+    ] = "true"
+    config.use_v2_model_runner = True
+    config.lora_config = None
+    with pytest.raises(
+        ValueError, match="prefill_store_delivery_wait_ready must be a boolean"
+    ):
+        MooncakeECConfig.from_vllm_config(config)
 
 
 def test_lookup_hits_do_not_load_or_insert(backend):

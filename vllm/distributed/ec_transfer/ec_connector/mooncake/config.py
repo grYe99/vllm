@@ -71,6 +71,7 @@ class MooncakeECConfig:
     pool_size: int
     cross_encoder_cache: bool = False
     prefill_store_delivery: bool = False
+    prefill_store_delivery_wait_ready: bool = False
     store_max_pending_items: int = 32
     store_max_pending_bytes: int = 2 * 1024**3
     store_read_buffer_bytes: int = 128 * 1024**2
@@ -136,6 +137,9 @@ class MooncakeECConfig:
                     "prefill_store_delivery requires --no-async-scheduling "
                     "on the Encoder to avoid in-flight nonresident cache hits"
                 )
+        wait_ready = get("prefill_store_delivery_wait_ready", False)
+        if not isinstance(wait_ready, bool):
+            raise ValueError("prefill_store_delivery_wait_ready must be a boolean")
         control_port = int(ec_config.ec_port) + (
             parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
         )
@@ -164,6 +168,7 @@ class MooncakeECConfig:
             pool_size=registered_buffer_size,
             cross_encoder_cache=shared_reuse,
             prefill_store_delivery=prefill_store_delivery,
+            prefill_store_delivery_wait_ready=wait_ready,
             store_max_pending_items=_positive_int(
                 "store_max_pending_items", get("store_max_pending_items", 32)
             ),

@@ -105,6 +105,9 @@ class ECMooncakeWorker:
         config = MooncakeECConfig.from_vllm_config(vllm_config)
         self._cross_encoder_cache = config.cross_encoder_cache
         self._prefill_store_delivery = config.prefill_store_delivery
+        self._prefill_store_delivery_wait_ready = (
+            config.prefill_store_delivery_wait_ready
+        )
         self._store_namespace = (
             build_embedding_namespace(vllm_config)
             if config.cross_encoder_cache or config.prefill_store_delivery
@@ -634,9 +637,14 @@ class ECMooncakeWorker:
                 self._bind_push_source(tensor, mm_hash)
         fallback_hashes: set[str] = set()
         if store_records:
-            ready_hashes, fallback_hashes, failed_ids = self._wait_for_store_deliveries(
-                store_records
-            )
+            if self._prefill_store_delivery_wait_ready:
+                ready_hashes, fallback_hashes, failed_ids = (
+                    self._wait_for_store_deliveries(store_records)
+                )
+            else:
+                ready_hashes, fallback_hashes, failed_ids = (
+                    self._wait_for_store_acceptances(store_records)
+                )
             self._remote_satisfied.update(ready_hashes)
             self._failed_saves.update(failed_ids)
             if fallback_hashes and self._output_store is not None:
@@ -1104,6 +1112,17 @@ class ECMooncakeWorker:
                 accepted[spec.mm_hash] = desc
         return accepted
 
+    def _wait_for_store_acceptances(
+        self, records: list[ProducerPushRecord]
+    ) -> tuple[set[str], set[str], set[str]]:
+        """Wait only until Prefill accepts or declines each Store delivery.
+
+        This does not poll GET completion. Confirmed admission-time P2P
+        declines still fall back in the same request. GET failures after
+        acceptance fail on Prefill and are not same-request retried here.
+        """
+        return self._settle_store_records(records, wait_ready=False)
+
     def _wait_for_store_deliveries(
         self, records: list[ProducerPushRecord]
     ) -> tuple[set[str], set[str], set[str]]:
@@ -1111,6 +1130,11 @@ class ECMooncakeWorker:
 
         Returns ready hashes, fallback hashes, and failed request ids.
         """
+        return self._settle_store_records(records, wait_ready=True)
+
+    def _settle_store_records(
+        self, records: list[ProducerPushRecord], *, wait_ready: bool
+    ) -> tuple[set[str], set[str], set[str]]:
         timeout = getattr(self, "_push_wait_timeout_s", 60.0)
         deadline = time.monotonic() + timeout
         outcomes: dict[str, str] = {}
@@ -1129,9 +1153,12 @@ class ECMooncakeWorker:
                 failed_ids.add(record.spec.request_id)
                 outcomes[transfer_id] = "failed"
                 continue
-            outcome = self._poll_store_shards(record, reservations, deadline)
+            if wait_ready:
+                outcome = self._poll_store_shards(record, reservations, deadline)
+            else:
+                outcome = self._classify_store_admission(reservations)
             outcomes[transfer_id] = outcome
-            if outcome == "ready":
+            if outcome in ("ready", "accepted"):
                 self._producer_pushes.complete_store_delivery(record)
             elif outcome == "failed_safe":
                 if not self._re_reserve_failed_store_shards(record, reservations):
@@ -1162,15 +1189,38 @@ class ECMooncakeWorker:
                 outcomes.get(record.spec.transfer_id, "failed")
                 for record in hash_records
             ]
-            if flags and all(flag == "ready" for flag in flags):
+            if flags and all(flag in ("ready", "accepted") for flag in flags):
                 ready_hashes.add(mm_hash)
             elif any(flag == "failed_safe" for flag in flags) and all(
-                flag in ("ready", "failed_safe") for flag in flags
+                flag in ("ready", "accepted", "failed_safe") for flag in flags
             ):
                 fallback_hashes.add(mm_hash)
                 # Successful ranks stay READY; failed ones were re-reserved for P2P.
                 # Ready shards stay terminal; only fallback records need a source.
         return ready_hashes, fallback_hashes, failed_ids
+
+    def _classify_store_admission(
+        self,
+        reservations: list[dict[str, Any]],
+    ) -> str:
+        """Classify a reserve response without waiting for Store GET."""
+        if not reservations:
+            return "failed"
+        if any(shard.get("cancelled") for shard in reservations):
+            return "failed"
+        if all(shard.get("ready") or shard.get("cached") for shard in reservations):
+            return "ready"
+        safe_failure = False
+        for shard in reservations:
+            if shard.get("ready") or shard.get("cached") or shard.get("store_pending"):
+                continue
+            if shard.get("write") and not shard.get("store_pending"):
+                safe_failure = True
+                continue
+            return "failed"
+        if safe_failure:
+            return "failed_safe"
+        return "accepted"
 
     def _poll_store_shards(
         self,

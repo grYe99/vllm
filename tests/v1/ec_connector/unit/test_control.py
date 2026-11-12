@@ -1285,3 +1285,195 @@ def test_queued_read_after_poison_is_a_safe_failure():
     assert not results["queued"].ok
     assert results["queued"].safe
     assert not reader.can_admit(16)
+
+
+def _reserve_store_push(coordinator, addr, *, transfer_id, request_id, namespace):
+    from concurrent.futures import Future
+
+    spec = ECMooncakePushSpec(
+        "img",
+        16,
+        (2, 2),
+        "float32",
+        addr,
+        transfer_id,
+        request_id=request_id,
+        store=StoreDeliverySpec(
+            namespace, "img", TensorSpec((2, 2), "torch.float32", 16)
+        ),
+    )
+    reservations = [coordinator._reserve_one(addr, spec)]
+    future: Future[list[dict[str, Any]]] = Future()
+    future.set_result(reservations)
+    record, _ = coordinator._producer_pushes.reserve(spec, lambda: future)
+    return record, reservations
+
+
+def _block_store_get(harness, release):
+    original = harness.store.batch_get_into
+
+    def blocked(*args, **kwargs):
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    harness.store.batch_get_into = blocked
+
+
+@pytest.mark.cpu_test
+def test_classify_store_admission_outcomes(native_free_workers):
+    worker = native_free_workers()
+    assert worker._classify_store_admission([]) == "failed"
+    assert (
+        worker._classify_store_admission([{"cancelled": True, "store_pending": True}])
+        == "failed"
+    )
+    assert worker._classify_store_admission([{"ready": True}]) == "ready"
+    assert worker._classify_store_admission([{"cached": True}]) == "ready"
+    assert (
+        worker._classify_store_admission([{"store_pending": True, "write": False}])
+        == "accepted"
+    )
+    assert (
+        worker._classify_store_admission([{"store_pending": True}, {"ready": True}])
+        == "accepted"
+    )
+    assert (
+        worker._classify_store_admission([{"write": True, "store_pending": False}])
+        == "failed_safe"
+    )
+    assert (
+        worker._classify_store_admission(
+            [{"store_pending": True}, {"write": True, "store_pending": False}]
+        )
+        == "failed_safe"
+    )
+    assert (
+        worker._classify_store_admission([{"write": False, "store_pending": False}])
+        == "failed"
+    )
+
+
+@pytest.mark.cpu_test
+def test_c2_returns_after_accept_without_waiting_for_get(native_free_workers):
+    """C2 returns after Prefill accepts the GET, even if the GET is still blocked."""
+    import threading
+
+    import torch
+
+    from vllm.distributed.ec_transfer.ec_connector.mooncake.producer import (
+        ProducerPushState,
+    )
+
+    coordinator = native_free_workers()
+    harness = _make_store_control_harness()
+    release = threading.Event()
+    try:
+        tensor = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        harness.reader._client.put_tensor(
+            make_embedding_key(harness.namespace, "img"), tensor
+        )
+        _block_store_get(harness, release)
+        record, reservations = _reserve_store_push(
+            coordinator,
+            harness.addr,
+            transfer_id="c2",
+            request_id="req-c2",
+            namespace=harness.namespace,
+        )
+        assert reservations[0]["store_pending"] is True
+        started = time.monotonic()
+        ready, fallback, failed = coordinator._wait_for_store_acceptances([record])
+        assert time.monotonic() - started < 1.0
+        assert ready == {"img"}
+        assert fallback == set()
+        assert failed == set()
+        assert record.state is ProducerPushState.DONE
+        assert coordinator._producer_pushes.cancel_requests({"req-c2"}) == []
+        status = harness.client.request(
+            harness.addr, {"op": "status", "transfer_id": "c2"}
+        )
+        assert status is not None
+        assert status.get("ready") is not True
+        release.set()
+        status = _wait_ready(harness, "c2")
+        assert status["ready"] is True
+        dest = harness.reservations.status("c2")
+        assert dest is not None and dest.allocation is not None
+        assert torch.equal(dest.allocation.tensor.cpu(), tensor)
+    finally:
+        release.set()
+        harness.close()
+
+
+@pytest.mark.cpu_test
+def test_c1_still_waits_for_store_get_completion(native_free_workers):
+    """The wait-ready path must not return until Prefill finishes the GET."""
+    import threading
+
+    import torch
+
+    coordinator = native_free_workers()
+    harness = _make_store_control_harness()
+    release = threading.Event()
+    try:
+        tensor = torch.ones(2, 2)
+        harness.reader._client.put_tensor(
+            make_embedding_key(harness.namespace, "img"), tensor
+        )
+        _block_store_get(harness, release)
+        record, reservations = _reserve_store_push(
+            coordinator,
+            harness.addr,
+            transfer_id="c1",
+            request_id="req-c1",
+            namespace=harness.namespace,
+        )
+        assert reservations[0]["store_pending"] is True
+        result: dict[str, tuple[set[str], set[str], set[str]]] = {}
+
+        def run():
+            result["out"] = coordinator._wait_for_store_deliveries([record])
+
+        waiter = threading.Thread(target=run)
+        waiter.start()
+        waiter.join(0.3)
+        assert waiter.is_alive()
+        assert "out" not in result
+        release.set()
+        waiter.join(5)
+        assert not waiter.is_alive()
+        ready, fallback, failed = result["out"]
+        assert ready == {"img"}
+        assert fallback == set()
+        assert failed == set()
+    finally:
+        release.set()
+        harness.close()
+
+
+@pytest.mark.cpu_test
+def test_c2_admission_decline_still_falls_back_to_p2p(native_free_workers):
+    """A same-request P2P fallback remains available when Prefill declines admission."""
+    from vllm.distributed.ec_transfer.ec_connector.mooncake.producer import (
+        ProducerPushState,
+    )
+
+    coordinator = native_free_workers()
+    harness = _make_store_control_harness(max_pending_items=0)
+    try:
+        record, reservations = _reserve_store_push(
+            coordinator,
+            harness.addr,
+            transfer_id="c2-decline",
+            request_id="req-c2-decline",
+            namespace=harness.namespace,
+        )
+        assert reservations[0]["store_pending"] is not True
+        assert reservations[0]["write"] is True
+        ready, fallback, failed = coordinator._wait_for_store_acceptances([record])
+        assert ready == set()
+        assert fallback == {"img"}
+        assert failed == set()
+        assert record.state is not ProducerPushState.DONE
+    finally:
+        harness.close()
