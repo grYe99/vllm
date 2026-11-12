@@ -116,3 +116,14 @@ def test_no_forward_reports_without_running_the_model():
 
     empty = NO_OP_EC_CONNECTOR.no_forward(_scheduler_output())
     assert empty is EMPTY_MODEL_RUNNER_OUTPUT
+
+
+def test_producer_exposes_remote_satisfied_after_start_save():
+    encoder_cache: dict[str, object] = {}
+    connector, fake = _connector(encoder_cache, is_producer=True, is_consumer=False)
+    fake.take_remote_satisfied.return_value = {"mm_remote"}
+
+    with connector.maybe_get_output(_scheduler_output()):
+        assert connector.remote_satisfied == {"mm_remote"}
+
+    assert fake.take_remote_satisfied.called

@@ -119,6 +119,29 @@ class MMEncoderModelRunner(GPUModelRunner):
             scheduler_output, self.kv_connector.no_forward(scheduler_output)
         )
 
+    def _exclude_remote_satisfied(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        satisfied: set[str],
+    ) -> dict[str, list[int]]:
+        encoder_cache = self.encoder_cache
+        if encoder_cache is None:
+            return scheduled_encoder_inputs
+        filtered: dict[str, list[int]] = {}
+        for req_id, input_ids in scheduled_encoder_inputs.items():
+            features = encoder_cache.mm_features.get(req_id)
+            if features is None:
+                filtered[req_id] = input_ids
+                continue
+            kept = [
+                input_id
+                for input_id in input_ids
+                if features[input_id].identifier not in satisfied
+            ]
+            if kept:
+                filtered[req_id] = kept
+        return filtered
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -167,6 +190,11 @@ class MMEncoderModelRunner(GPUModelRunner):
         with self.ec_connector.maybe_get_output(
             scheduler_output
         ) as ec_connector_output:
+            satisfied = self.ec_connector.remote_satisfied
+            if satisfied:
+                scheduled_encoder_inputs = self._exclude_remote_satisfied(
+                    scheduled_encoder_inputs, satisfied
+                )
             self.model_state.execute_mm_encoder(scheduled_encoder_inputs)
 
         return ModelRunnerOutput.with_ec_conn_output(

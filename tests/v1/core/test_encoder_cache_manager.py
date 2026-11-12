@@ -505,3 +505,80 @@ def test_encoder_decoder_cache_manager_reset_allows_fresh_allocations():
 
     assert manager.num_free_slots == 2
     assert "img2" in manager.allocated
+
+
+def test_nonresident_remote_result_is_not_a_later_local_hit():
+    """A Store-delivered output must not be reused as an E-local cache hit."""
+    cache = EncoderCacheManager(cache_size=10)
+    first = MockRequest("r1", ["imgA"], [4])
+    assert cache.can_allocate(first, 0, int(1e9), 0)
+    cache.allocate(first, 0)
+    assert cache.check_and_update_cache(first, 0)
+
+    cache.mark_nonresident({"imgA"})
+    # The first request still holds a reference, but later checks must miss.
+    assert not cache.check_and_update_cache(first, 0)
+
+    second = MockRequest("r2", ["imgA"], [4])
+    assert not cache.check_and_update_cache(second, 0)
+    assert cache.can_allocate(second, 0, int(1e9), 0)
+    cache.allocate(second, 0)
+    assert cache.check_and_update_cache(second, 0)
+    assert "imgA" not in cache._nonresident
+
+
+def test_nonresident_unreferenced_entry_is_not_kept_in_lru():
+    cache = EncoderCacheManager(cache_size=10)
+    req = MockRequest("r1", ["imgA"], [4])
+    assert cache.can_allocate(req, 0, int(1e9), 0)
+    cache.allocate(req, 0)
+    cache.free_encoder_input(req, 0)
+    assert "imgA" in cache.freeable
+
+    cache.mark_nonresident({"imgA"})
+    assert "imgA" not in cache.cached
+    assert "imgA" not in cache.freeable
+    assert cache.num_free_slots == 10
+    assert cache.num_freeable_slots == 10
+    assert "imgA" in cache.get_freed_mm_hashes()
+
+    later = MockRequest("r2", ["imgA"], [4])
+    assert not cache.check_and_update_cache(later, 0)
+
+
+def test_nonresident_refunds_budget_while_preserving_other_resident_tensors():
+    cache = EncoderCacheManager(cache_size=10)
+    req = MockRequest("r1", ["remote", "local"], [4, 4])
+    assert cache.can_allocate(req, 0, int(1e9), 0)
+    cache.allocate(req, 0)
+    assert cache.can_allocate(req, 1, int(1e9), 0)
+    cache.allocate(req, 1)
+    assert cache.num_free_slots == 2
+
+    cache.mark_nonresident({"remote"})
+    assert cache.num_free_slots == 6
+    assert cache.check_and_update_cache(req, 1)
+    assert not cache.check_and_update_cache(req, 0)
+
+    cache.free_encoder_input(req, 0)
+    cache.free_encoder_input(req, 1)
+    assert "remote" not in cache.freeable
+    assert "local" in cache.freeable
+    assert cache.num_free_slots == 6
+    assert cache.num_freeable_slots == 10
+
+
+def test_duplicate_hash_nonresident_releases_refs_once():
+    cache = EncoderCacheManager(cache_size=10)
+    req = MockRequest("r1", ["imgA", "imgA"], [3, 3])
+    assert cache.can_allocate(req, 0, int(1e9), 0)
+    cache.allocate(req, 0)
+    cache.check_and_update_cache(req, 1)
+    cache.mark_nonresident({"imgA"})
+    cache.free_encoder_input(req, 0)
+    # The second occurrence still references the placeholder.
+    assert "imgA" in cache.cached
+    cache.free_encoder_input(req, 1)
+    assert "imgA" not in cache.cached
+    assert "imgA" not in cache.freeable
+    assert cache.num_free_slots == 10

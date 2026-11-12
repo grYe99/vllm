@@ -110,6 +110,7 @@ class ECMooncakeScheduler:
         # free notifications the Scheduler already sends. Tracking it here
         # keeps `ensure_cache_available` on the upstream two-argument shape.
         self._local_cache: set[str] = set()
+        self._nonresident_outputs: set[str] = set()
         self._failed_saves: set[str] = set()
 
     def _cancel_remote(self, consumer_zmq: str, transfer_id: str) -> bool:
@@ -520,6 +521,12 @@ class ECMooncakeScheduler:
             self._transfers.reclaim(mm_hash, time.monotonic())
         self._scheduler_pending_work = meta.pending_saves
         self._failed_saves.update(meta.failed_saves)
+        self._nonresident_outputs.update(meta.nonresident)
+        self._local_cache.difference_update(meta.nonresident)
+
+    def take_nonresident_outputs(self) -> set[str]:
+        nonresident, self._nonresident_outputs = self._nonresident_outputs, set()
+        return nonresident
 
     def has_pending_push_work(self) -> bool:
         return self._scheduler_pending_work

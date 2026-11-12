@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
@@ -36,6 +37,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakePushSpec,
     ECMooncakeWorkerMetadata,
+    StoreDeliverySpec,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.producer import (
     ProducerPushManager,
@@ -45,12 +47,19 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.reservation import (
     ConsumerReservationManager,
     ConsumerReservationState,
 )
+from vllm.distributed.ec_transfer.ec_connector.mooncake.store_reader import (
+    StoreDeliveryReader,
+    StoreReadRequest,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.transfer import (
     MooncakeTransfer,
     ensure_mooncake_available,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake_store_embedding.data import (
+    STORE_DELIVERY_CAPABILITY,
+    TensorSpec,
     build_embedding_namespace,
+    store_namespace_is_approved,
 )
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
@@ -94,17 +103,30 @@ class ECMooncakeWorker:
     def __init__(self, vllm_config: VllmConfig) -> None:
         ensure_mooncake_available()
         config = MooncakeECConfig.from_vllm_config(vllm_config)
+        self._cross_encoder_cache = config.cross_encoder_cache
+        self._prefill_store_delivery = config.prefill_store_delivery
+        self._prefill_store_delivery_wait_ready = (
+            config.prefill_store_delivery_wait_ready
+        )
+        self._store_namespace = (
+            build_embedding_namespace(vllm_config)
+            if config.cross_encoder_cache or config.prefill_store_delivery
+            else None
+        )
         self._store_config = (
             (
-                build_embedding_namespace(vllm_config),
+                self._store_namespace,
                 config.store_max_pending_items,
                 config.store_max_pending_bytes,
                 config.store_read_buffer_bytes,
             )
-            if config.cross_encoder_cache
+            if self._store_namespace is not None
             else None
         )
         self._output_store: MooncakeEmbeddingStoreBackend | None = None
+        self._store_reader: StoreDeliveryReader | None = None
+        self._remote_satisfied: set[str] = set()
+        self._push_wait_timeout_s = config.push_wait_timeout_s
         self.is_producer = config.is_producer
         self.is_consumer = config.is_consumer
         self._buffer_device = config.buffer_device
@@ -191,7 +213,8 @@ class ECMooncakeWorker:
             self._is_receiving_rank = True
 
     def start_services(self) -> None:
-        if self._store_config is not None and self._output_store is None:
+        store_client = None
+        if self._store_config is not None:
             from ..mooncake_store_embedding.backend import (
                 MooncakeEmbeddingStoreBackend,
             )
@@ -200,12 +223,20 @@ class ECMooncakeWorker:
             )
 
             namespace, max_items, max_bytes, read_bytes = self._store_config
-            self._output_store = MooncakeEmbeddingStoreBackend(
-                create_mooncake_embedding_store_client(read_buffer_bytes=read_bytes),
-                namespace,
-                max_pending_items=max_items,
-                max_pending_bytes=max_bytes,
-            )
+            if (
+                self._cross_encoder_cache
+                and self.is_producer
+                and self._output_store is None
+            ):
+                store_client = create_mooncake_embedding_store_client(
+                    read_buffer_bytes=read_bytes
+                )
+                self._output_store = MooncakeEmbeddingStoreBackend(
+                    store_client,
+                    namespace,
+                    max_pending_items=max_items,
+                    max_pending_bytes=max_bytes,
+                )
         if not self.is_consumer or self._control_server is not None:
             return
         self._resolve_consumer_rank()
@@ -220,6 +251,33 @@ class ECMooncakeWorker:
                 "Mooncake push mode requires a registered consumer buffer pool."
             )
         base_port = self._control_port
+        if (
+            self._prefill_store_delivery
+            and self._store_reader is None
+            and self._store_config is not None
+        ):
+            from ..mooncake_store_embedding.store_client import (
+                create_mooncake_embedding_store_client,
+            )
+
+            namespace, max_items, max_bytes, read_bytes = self._store_config
+            if store_client is None:
+                if self._output_store is not None:
+                    store_client = self._output_store.store_client
+                else:
+                    store_client = create_mooncake_embedding_store_client(
+                        read_buffer_bytes=read_bytes
+                    )
+            self._store_reader = StoreDeliveryReader(
+                store_client,
+                device=consumer_pool.device,
+                max_pending_items=max_items,
+                max_pending_bytes=max_bytes,
+                read_buffer_bytes=read_bytes,
+            )
+        capabilities = (
+            [STORE_DELIVERY_CAPABILITY] if self._store_reader is not None else []
+        )
         self._control_server = ConsumerControlServer(
             # The reservation channel hands out registered-memory addresses
             # and takes cancellations, so it listens where the Consumer
@@ -234,6 +292,8 @@ class ECMooncakeWorker:
             peer_ports=[base_port + rank for rank in range(self._tp_size)],
             device=consumer_pool.device,
             drain_ready=self._reservations.drain_ready,
+            poll_store=self._poll_store_completions,
+            capabilities=capabilities,
         )
         try:
             self._control_server.start()
@@ -255,9 +315,18 @@ class ECMooncakeWorker:
         if expected_nbytes != nbytes:
             raise ValueError("shape and dtype do not match nbytes")
 
+        source = "p2p"
+        store_spec = None
+        if payload.get("store") is not None and self._store_reader is not None:
+            store_spec = self._validate_store_descriptor(
+                payload["store"], mm_hash, nbytes, shape, dtype_name
+            )
+            if self._store_reader.can_admit(nbytes):
+                source = "store"
+
         self._reservations.expire()
         reservation, should_write = self._reservations.reserve(
-            transfer_id, mm_hash, nbytes, shape, dtype_name, dtype
+            transfer_id, mm_hash, nbytes, shape, dtype_name, dtype, source=source
         )
         if reservation is None:
             raise RuntimeError("EC consumer buffer pool is full")
@@ -276,28 +345,81 @@ class ECMooncakeWorker:
             }
         assert reservation.allocation is not None
 
+        store_pending = False
+        if (
+            should_write
+            and source == "store"
+            and store_spec is not None
+            and reservation.state is ConsumerReservationState.WRITING
+            and self._store_reader is not None
+        ):
+            admitted = self._store_reader.enqueue(
+                StoreReadRequest(
+                    transfer_id=transfer_id,
+                    reservation_id=reservation.reservation_id,
+                    mm_hash=mm_hash,
+                    namespace=store_spec.namespace,
+                    tensor_spec=store_spec.tensor_spec,
+                    destination=reservation.allocation.tensor,
+                )
+            )
+            if admitted:
+                store_pending = True
+            else:
+                reservation.source = "p2p"
+        elif (
+            reservation.source == "store"
+            and reservation.state is ConsumerReservationState.WRITING
+            and not reservation.store_io_retained
+            and reservation.store_error is None
+        ):
+            store_pending = True
+
         return {
             "reservation_id": reservation.reservation_id,
             "dst_session": self._transfer.local_session(),
             "dst_ptr": reservation.allocation.tensor.data_ptr(),
             "nbytes": reservation.allocation.tensor.nbytes,
-            "write": should_write,
+            "write": should_write and reservation.source != "store",
             "ready": reservation.state is ConsumerReservationState.READY,
             "cached": reservation.lease is not None,
+            "store_pending": store_pending,
         }
 
     def _push_status(self, transfer_id: str) -> dict[str, Any] | None:
         reservation = self._reservations.status(transfer_id)
         if reservation is None:
             return None
-        assert reservation.allocation is not None
+        nbytes = (
+            reservation.allocation.tensor.nbytes
+            if reservation.allocation is not None
+            else 0
+        )
+        store_pending = (
+            reservation.source == "store"
+            and reservation.state is ConsumerReservationState.WRITING
+            and not reservation.store_io_retained
+            and reservation.store_error is None
+        )
+        store_failed_safe = (
+            reservation.state is ConsumerReservationState.STORE_FAILED
+            or (
+                reservation.source == "store"
+                and reservation.store_error is not None
+                and not reservation.store_io_retained
+                and reservation.state is not ConsumerReservationState.WRITING
+            )
+        )
         return {
             "mm_hash": reservation.mm_hash,
             "ready": reservation.state is ConsumerReservationState.READY,
             "reservation_id": reservation.reservation_id,
-            "nbytes": reservation.allocation.tensor.nbytes,
+            "nbytes": nbytes,
             "shape": list(reservation.shape),
             "dtype": reservation.dtype,
+            "store_pending": store_pending,
+            "store_failed_safe": store_failed_safe,
+            "error": reservation.store_error,
         }
 
     def _shard_executor(self) -> ThreadPoolExecutor:
@@ -312,14 +434,7 @@ class ECMooncakeWorker:
     def _reserve_one(self, addr: str, spec: ECMooncakePushSpec) -> dict[str, Any]:
         result = self._control_client.request(
             addr,
-            {
-                "op": "reserve",
-                "transfer_id": spec.transfer_id,
-                "mm_hash": spec.mm_hash,
-                "nbytes": spec.nbytes,
-                "shape": list(spec.shape),
-                "dtype": spec.dtype,
-            },
+            {"op": "reserve", **self._reserve_payload(spec)},
         )
         if not isinstance(result, dict):
             raise RuntimeError("Invalid EC reservation response")
@@ -485,12 +600,29 @@ class ECMooncakeWorker:
         **kwargs: Any,
     ) -> None:
         self._collecting_sources = True
+        self._remote_satisfied = set()
         new: dict[str, list[ProducerPushRecord]] = {}
+        encoder_cache_dict = encoder_cache if isinstance(encoder_cache, dict) else {}
+        store_hits = self._classify_store_hits(metadata, encoder_cache_dict)
+        store_records: list[ProducerPushRecord] = []
         for spec in metadata.pushes:
+            reserve_spec = spec
+            desc = store_hits.get(spec.mm_hash)
+            if desc is not None:
+                reserve_spec = replace(
+                    spec,
+                    store=StoreDeliverySpec(
+                        namespace=desc.namespace,
+                        identifier=desc.identifier,
+                        tensor_spec=desc.tensor_spec,
+                    ),
+                )
             try:
-                record, created = self._producer_pushes.reserve(spec, Future)
+                record, created = self._producer_pushes.reserve(reserve_spec, Future)
+                if reserve_spec.store is not None:
+                    store_records.append(record)
                 if created:
-                    new.setdefault(spec.consumer_zmq, []).append(record)
+                    new.setdefault(reserve_spec.consumer_zmq, []).append(record)
             except ValueError:
                 logger.warning("Rejected conflicting EC push", exc_info=True)
                 self._failed_saves.add(spec.request_id)
@@ -503,14 +635,46 @@ class ECMooncakeWorker:
             tensor = encoder_cache.get(mm_hash)
             if tensor is not None:
                 self._bind_push_source(tensor, mm_hash)
+        fallback_hashes: set[str] = set()
+        if store_records:
+            if self._prefill_store_delivery_wait_ready:
+                ready_hashes, fallback_hashes, failed_ids = (
+                    self._wait_for_store_deliveries(store_records)
+                )
+            else:
+                ready_hashes, fallback_hashes, failed_ids = (
+                    self._wait_for_store_acceptances(store_records)
+                )
+            self._remote_satisfied.update(ready_hashes)
+            self._failed_saves.update(failed_ids)
+            if fallback_hashes and self._output_store is not None:
+                loaded = self._output_store.resolve_inputs(
+                    {
+                        mm_hash: metadata.store_candidates[mm_hash]
+                        for mm_hash in fallback_hashes
+                        if mm_hash in metadata.store_candidates
+                    },
+                    encoder_cache,
+                    self._buffer_device,
+                )
+                for mm_hash in loaded:
+                    self._bind_push_source(encoder_cache[mm_hash], mm_hash)
         if self._output_store is not None:
-            loaded = self._output_store.resolve_inputs(
-                metadata.store_candidates, encoder_cache, self._buffer_device
-            )
-            # Loaded entries precede the runner's new-output snapshot, so they
-            # need explicit P2P source binding here.
-            for mm_hash in loaded:
-                self._bind_push_source(encoder_cache[mm_hash], mm_hash)
+            leftover = {
+                identifier: spec
+                for identifier, spec in metadata.store_candidates.items()
+                if identifier not in self._remote_satisfied
+                and identifier not in fallback_hashes
+            }
+            if leftover:
+                loaded = self._output_store.resolve_inputs(
+                    leftover, encoder_cache, self._buffer_device
+                )
+                # Loaded entries precede the runner's new-output snapshot, so they
+                # need explicit P2P source binding here.
+                for mm_hash in loaded:
+                    self._bind_push_source(encoder_cache[mm_hash], mm_hash)
+            self._output_store.set_step_candidates(set(metadata.store_candidates))
 
     def _reserve_batch(self, records: list[ProducerPushRecord]) -> None:
         """Resolve independent item futures with one reserve RPC per shard."""
@@ -544,16 +708,7 @@ class ECMooncakeWorker:
                 addr,
                 {
                     "op": "reserve_batch",
-                    "items": [
-                        {
-                            "transfer_id": spec.transfer_id,
-                            "mm_hash": spec.mm_hash,
-                            "nbytes": spec.nbytes,
-                            "shape": list(spec.shape),
-                            "dtype": spec.dtype,
-                        }
-                        for spec in specs
-                    ],
+                    "items": [self._reserve_payload(spec) for spec in specs],
                 },
             )
             items = response["items"]
@@ -846,6 +1001,320 @@ class ECMooncakeWorker:
             self._push_batch,
         )
 
+    def take_remote_satisfied(self) -> set[str]:
+        return set(getattr(self, "_remote_satisfied", set()))
+
+    def _reserve_payload(self, spec: ECMooncakePushSpec) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "transfer_id": spec.transfer_id,
+            "mm_hash": spec.mm_hash,
+            "nbytes": spec.nbytes,
+            "shape": list(spec.shape),
+            "dtype": spec.dtype,
+        }
+        if spec.store is not None:
+            payload["store"] = {
+                "namespace": spec.store.namespace,
+                "identifier": spec.store.identifier,
+                "protocol": spec.store.protocol,
+                "shape": list(spec.store.tensor_spec.shape),
+                "dtype": spec.store.tensor_spec.dtype,
+                "nbytes": spec.store.tensor_spec.nbytes,
+            }
+        return payload
+
+    def _validate_store_descriptor(
+        self,
+        payload: object,
+        mm_hash: str,
+        nbytes: int,
+        shape: tuple[int, ...],
+        dtype_name: str,
+    ) -> StoreDeliverySpec:
+        if not isinstance(payload, dict):
+            raise ValueError("store descriptor must be an object")
+        namespace = str(payload.get("namespace", ""))
+        identifier = str(payload.get("identifier", ""))
+        protocol = str(payload.get("protocol", ""))
+        desc_shape = tuple(int(value) for value in payload.get("shape", ()))
+        raw_dtype = str(payload.get("dtype", ""))
+        desc_dtype = (
+            raw_dtype if raw_dtype.startswith("torch.") else f"torch.{raw_dtype}"
+        )
+        desc_nbytes = int(payload.get("nbytes", -1))
+        if identifier != mm_hash:
+            raise ValueError("store descriptor identifier does not match transfer")
+        if desc_shape != shape or desc_dtype.removeprefix(
+            "torch."
+        ) != dtype_name.removeprefix("torch."):
+            raise ValueError(
+                "store descriptor tensor contract does not match reservation"
+            )
+        if desc_nbytes != nbytes or nbytes <= 0:
+            raise ValueError("store descriptor byte count is invalid")
+        if protocol != "v3":
+            raise ValueError("unsupported store delivery protocol")
+        approved = self._store_namespace
+        if not approved or not store_namespace_is_approved(namespace, approved):
+            raise ValueError("store namespace is not approved for this deployment")
+        return StoreDeliverySpec(
+            namespace=namespace,
+            identifier=identifier,
+            tensor_spec=TensorSpec(desc_shape, desc_dtype, desc_nbytes),
+            protocol=protocol,
+        )
+
+    def _poll_store_completions(self) -> list[str]:
+        reader = getattr(self, "_store_reader", None)
+        if reader is None:
+            return []
+        ready: list[str] = []
+        for completion in reader.drain():
+            accepted, became_ready = self._reservations.complete_store(
+                completion.transfer_id,
+                completion.reservation_id,
+                ok=completion.ok,
+                safe=completion.safe,
+                error=completion.error,
+            )
+            if became_ready:
+                ready.append(completion.transfer_id)
+            ready.extend(self._reservations.drain_ready())
+        return ready
+
+    def _classify_store_hits(
+        self,
+        metadata: ECMooncakeConnectorMetadata,
+        encoder_cache: dict[str, torch.Tensor],
+    ):
+        from ..mooncake_store_embedding.backend import StoreHitDescriptor
+
+        if not getattr(self, "_prefill_store_delivery", False):
+            return {}
+        if self._output_store is None or not metadata.store_candidates:
+            return {}
+        missing = {
+            spec.mm_hash: metadata.store_candidates[spec.mm_hash]
+            for spec in metadata.pushes
+            if spec.mm_hash not in encoder_cache
+            and spec.mm_hash in metadata.store_candidates
+        }
+        if not missing:
+            return {}
+        hits = self._output_store.lookup_hits(missing, encoder_cache)
+        accepted: dict[str, StoreHitDescriptor] = {}
+        for spec in metadata.pushes:
+            desc = hits.get(spec.mm_hash)
+            if desc is None:
+                continue
+            capabilities = self._control_client.consumer_capabilities(spec.consumer_zmq)
+            if STORE_DELIVERY_CAPABILITY in capabilities:
+                accepted[spec.mm_hash] = desc
+        return accepted
+
+    def _wait_for_store_acceptances(
+        self, records: list[ProducerPushRecord]
+    ) -> tuple[set[str], set[str], set[str]]:
+        """Wait only until Prefill accepts or declines each Store delivery.
+
+        This does not poll GET completion. Confirmed admission-time P2P
+        declines still fall back in the same request. GET failures after
+        acceptance fail on Prefill and are not same-request retried here.
+        """
+        return self._settle_store_records(records, wait_ready=False)
+
+    def _wait_for_store_deliveries(
+        self, records: list[ProducerPushRecord]
+    ) -> tuple[set[str], set[str], set[str]]:
+        """Wait for P Store acquisition.
+
+        Returns ready hashes, fallback hashes, and failed request ids.
+        """
+        return self._settle_store_records(records, wait_ready=True)
+
+    def _settle_store_records(
+        self, records: list[ProducerPushRecord], *, wait_ready: bool
+    ) -> tuple[set[str], set[str], set[str]]:
+        timeout = getattr(self, "_push_wait_timeout_s", 60.0)
+        deadline = time.monotonic() + timeout
+        outcomes: dict[str, str] = {}
+        failed_ids: set[str] = set()
+        for record in records:
+            transfer_id = record.spec.transfer_id
+            try:
+                reservations = self._producer_pushes.resolve_reservations(record)
+            except Exception as exc:
+                logger.warning(
+                    "Store delivery reservation failed for transfer_id=%s",
+                    transfer_id,
+                    exc_info=True,
+                )
+                self._producer_pushes.fail([record], exc)
+                failed_ids.add(record.spec.request_id)
+                outcomes[transfer_id] = "failed"
+                continue
+            if wait_ready:
+                outcome = self._poll_store_shards(record, reservations, deadline)
+            else:
+                outcome = self._classify_store_admission(reservations)
+            outcomes[transfer_id] = outcome
+            if outcome in ("ready", "accepted"):
+                self._producer_pushes.complete_store_delivery(record)
+            elif outcome == "failed_safe":
+                if not self._re_reserve_failed_store_shards(record, reservations):
+                    self._producer_pushes.fail(
+                        [record],
+                        RuntimeError(
+                            f"Could not fall back to P2P for transfer_id={transfer_id}"
+                        ),
+                    )
+                    failed_ids.add(record.spec.request_id)
+                    outcomes[transfer_id] = "failed"
+            else:
+                self._producer_pushes.fail(
+                    [record],
+                    RuntimeError(
+                        "Store delivery failed for "
+                        f"transfer_id={transfer_id}: {outcome}"
+                    ),
+                )
+                failed_ids.add(record.spec.request_id)
+        ready_hashes: set[str] = set()
+        fallback_hashes: set[str] = set()
+        by_hash: dict[str, list[ProducerPushRecord]] = {}
+        for record in records:
+            by_hash.setdefault(record.spec.mm_hash, []).append(record)
+        for mm_hash, hash_records in by_hash.items():
+            flags = [
+                outcomes.get(record.spec.transfer_id, "failed")
+                for record in hash_records
+            ]
+            if flags and all(flag in ("ready", "accepted") for flag in flags):
+                ready_hashes.add(mm_hash)
+            elif any(flag == "failed_safe" for flag in flags) and all(
+                flag in ("ready", "accepted", "failed_safe") for flag in flags
+            ):
+                fallback_hashes.add(mm_hash)
+                # Successful ranks stay READY; failed ones were re-reserved for P2P.
+                # Ready shards stay terminal; only fallback records need a source.
+        return ready_hashes, fallback_hashes, failed_ids
+
+    def _classify_store_admission(
+        self,
+        reservations: list[dict[str, Any]],
+    ) -> str:
+        """Classify a reserve response without waiting for Store GET."""
+        if not reservations:
+            return "failed"
+        if any(shard.get("cancelled") for shard in reservations):
+            return "failed"
+        if all(shard.get("ready") or shard.get("cached") for shard in reservations):
+            return "ready"
+        safe_failure = False
+        for shard in reservations:
+            if shard.get("ready") or shard.get("cached") or shard.get("store_pending"):
+                continue
+            if shard.get("write") and not shard.get("store_pending"):
+                safe_failure = True
+                continue
+            return "failed"
+        if safe_failure:
+            return "failed_safe"
+        return "accepted"
+
+    def _poll_store_shards(
+        self,
+        record: ProducerPushRecord,
+        reservations: list[dict[str, Any]],
+        deadline: float,
+    ) -> str:
+        if not reservations:
+            return "failed"
+        # A consumer that rejected Store delivery returns a normal P2P reservation.
+        if all(shard.get("ready") or shard.get("cached") for shard in reservations):
+            return "ready"
+        remaining = [
+            shard
+            for shard in reservations
+            if not shard.get("ready") and not shard.get("cancelled")
+        ]
+        safe_failure = False
+        while remaining:
+            if time.monotonic() >= deadline:
+                return "timeout"
+            still: list[dict[str, Any]] = []
+            for shard in remaining:
+                if shard.get("write") and not shard.get("store_pending"):
+                    # Store admission was declined; this E owns the P2P write.
+                    safe_failure = True
+                    continue
+                addr = shard.get("addr")
+                if not isinstance(addr, str) or not addr:
+                    return "failed"
+                try:
+                    status = self._control_client.request(
+                        addr,
+                        {"op": "status", "transfer_id": record.spec.transfer_id},
+                    )
+                except Exception:
+                    return "failed"
+                if not isinstance(status, dict):
+                    return "failed"
+                if status.get("reservation_id") != shard.get("reservation_id"):
+                    return "failed"
+                if status.get("ready"):
+                    shard["ready"] = True
+                    shard["write"] = False
+                    continue
+                if status.get("store_failed_safe"):
+                    shard["store_failed_safe"] = True
+                    shard["store_pending"] = False
+                    safe_failure = True
+                    continue
+                if status.get("error") and not status.get("store_pending"):
+                    return "failed"
+                still.append(shard)
+            remaining = still
+            if remaining:
+                time.sleep(0.005)
+        if safe_failure:
+            return "failed_safe"
+        if any(shard.get("cancelled") for shard in reservations):
+            return "failed"
+        return "ready"
+
+    def _re_reserve_failed_store_shards(
+        self,
+        record: ProducerPushRecord,
+        reservations: list[dict[str, Any]],
+    ) -> bool:
+        """Keep READY shards and allocate a fresh P2P generation for the rest."""
+        replacements: list[dict[str, Any]] = []
+        try:
+            for shard in reservations:
+                if shard.get("cancelled"):
+                    return False
+                if shard.get("store_failed_safe"):
+                    # STORE_FAILED already settled its writer. A normal P2P
+                    # rejection still owns a usable reservation; cancelling it
+                    # would leave a CANCELLED tombstone for the same transfer.
+                    shard = self._reserve_one(
+                        str(shard["addr"]), replace(record.spec, store=None)
+                    )
+                    if shard.get("cancelled") or shard.get("store_pending"):
+                        return False
+                replacements.append(shard)
+        except Exception:
+            logger.warning(
+                "P2P fallback reservation failed for transfer_id=%s",
+                record.spec.transfer_id,
+                exc_info=True,
+            )
+            return False
+        record.spec = replace(record.spec, store=None)
+        self._producer_pushes.replace_reservations(record, replacements)
+        return True
+
     def _bind_push_source(self, tensor: torch.Tensor, mm_hash: str) -> None:
         ready_event = None
         if tensor.device.type == "cuda":
@@ -935,10 +1404,12 @@ class ECMooncakeWorker:
             reclaimed=reclaimed,
             pending_saves=self._producer_pushes.pending,
             failed_saves=self._failed_saves,
+            nonresident=set(getattr(self, "_remote_satisfied", set())),
         )
         self._failed_saves = set()
         self._completed_loads = set()
         self._failed_loads = set()
+        self._remote_satisfied = set()
         return meta
 
     def close(self) -> None:
@@ -952,6 +1423,9 @@ class ECMooncakeWorker:
             dispatcher.join()
         if self._control_server is not None:
             self._reservations.begin_shutdown()
+        if self._store_reader is not None:
+            self._store_reader.shutdown(wait=True)
+            self._poll_store_completions()
         self._flush_pending_pushes()
         for record in self._producer_pushes.cancel_requests(None):
             self._producer_pushes.submit_cancel(
@@ -986,3 +1460,6 @@ class ECMooncakeWorker:
         if self._output_store is not None:
             self._output_store.shutdown()
             self._output_store = None
+        elif self._store_reader is not None:
+            self._store_reader._client.close()
+            self._store_reader = None

@@ -7332,6 +7332,82 @@ def test_unavailable_encoder_input_fails_the_request_as_retryable():
     assert [o.finish_reason for o in engine_outputs] == [FinishReason.ERROR]
 
 
+def test_encoder_delivery_failure_precedes_prompt_completion(monkeypatch):
+    """An E step cannot report success before consuming its delivery failure."""
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+    from vllm.distributed.ec_transfer.ec_connector.mooncake import scheduler as ec
+    from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
+        ECMooncakeWorkerMetadata,
+    )
+    from vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector import (
+        ECMooncakeConnector,
+    )
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr("vllm.platforms.current_platform", CpuPlatform())
+    monkeypatch.setattr(ec, "ensure_mooncake_available", lambda: None)
+    scheduler = create_scheduler(use_ec_connector=True, ec_role="ec_producer")
+    scheduler.vllm_config.ec_transfer_config.ec_connector = "ECMooncakeConnector"
+    scheduler.ec_connector = ECMooncakeConnector(
+        scheduler.vllm_config, ECConnectorRole.SCHEDULER
+    )
+    requests = create_requests(num_requests=2, num_tokens=6)
+    for request in requests:
+        scheduler.add_request(request)
+    step = scheduler.schedule()
+    result = make_empty_encoder_model_runner_output(step)
+    result.ec_connector_output = ECConnectorOutput(
+        ec_connector_worker_meta=ECMooncakeWorkerMetadata(
+            failed_saves={requests[0].request_id}
+        )
+    )
+    try:
+        outputs = scheduler.update_from_output(step, result)
+        reasons = {item.request_id: item.finish_reason for item in outputs[0].outputs}
+        assert reasons[requests[0].request_id] == FinishReason.ERROR
+        assert reasons[requests[1].request_id] == FinishReason.STOP
+    finally:
+        scheduler.ec_connector.shutdown()
+
+
+@pytest.mark.parametrize(
+    "ec_role,async_scheduling",
+    [
+        ("ec_producer", True),
+        ("ec_producer", False),
+        ("ec_consumer", True),
+    ],
+)
+def test_hybrid_store_delivery_rejects_inflight_encoder_cache_hits(
+    monkeypatch, ec_role, async_scheduling
+):
+    """E must not schedule a cache hit before remote-only feedback arrives."""
+    from vllm.distributed.ec_transfer.ec_connector.mooncake.config import (
+        MooncakeECConfig,
+    )
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr("vllm.platforms.current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        use_ec_connector=True,
+        ec_role=ec_role,
+        async_scheduling=async_scheduling,
+    )
+    config = scheduler.vllm_config
+    # CPU setup disables async; restore the resolved GPU scheduling mode.
+    config.scheduler_config.async_scheduling = async_scheduling
+    config.ec_transfer_config.ec_connector_extra_config.update(
+        cross_encoder_cache=ec_role == "ec_producer",
+        prefill_store_delivery=True,
+    )
+    if ec_role == "ec_producer" and async_scheduling:
+        with pytest.raises(ValueError, match="no-async-scheduling"):
+            MooncakeECConfig.from_vllm_config(config)
+    else:
+        assert MooncakeECConfig.from_vllm_config(config).prefill_store_delivery
+
+
 def _create_mm_request_with_embedding_positions(
     request_id: str, identifier: str, is_embed: list[bool]
 ) -> Request:

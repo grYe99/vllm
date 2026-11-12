@@ -40,6 +40,7 @@ class ControlClient:
         self._timeout_ms = timeout_ms
         self._local = threading.local()
         self._topologies: dict[str, list[str]] = {}
+        self._capabilities: dict[str, frozenset[str]] = {}
         self._closed = False
 
     def _sockets(self) -> dict[str, zmq.Socket]:
@@ -90,6 +91,12 @@ class ControlClient:
                 raise ValueError("invalid or empty peer list")
             prefix = base_addr.rsplit(":", 1)[0]
             shards = [f"{prefix}:{int(port)}" for port in ports]
+            caps = reply.get("capabilities") if isinstance(reply, dict) else None
+            self._capabilities[base_addr] = (
+                frozenset(str(item) for item in caps)
+                if isinstance(caps, list)
+                else frozenset()
+            )
         except Exception:
             logger.warning(
                 "EC Mooncake consumer at %s did not report its shards",
@@ -99,6 +106,11 @@ class ControlClient:
             return None
         self._topologies[base_addr] = shards
         return shards
+
+    def consumer_capabilities(self, base_addr: str) -> frozenset[str]:
+        if base_addr not in self._topologies:
+            self.discover_shards(base_addr)
+        return self._capabilities.get(base_addr, frozenset())
 
     def close(self) -> None:
         if self._closed:
@@ -257,10 +269,13 @@ class ConsumerControlServer:
         peer_ports: list[int] | None = None,
         device: torch.device | None = None,
         drain_ready: Callable[[], list[str]] = lambda: [],
+        poll_store: Callable[[], list[str]] = lambda: [],
+        capabilities: list[str] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.peer_ports = peer_ports or [port]
+        self.capabilities = list(capabilities or [])
         self._device = device
         self.event_port: int | None = None
         self._reserve = reserve
@@ -269,6 +284,7 @@ class ConsumerControlServer:
         self._cancel = cancel
         self._reap = reap
         self._drain_ready = drain_ready
+        self._poll_store = poll_store
         self._stop = threading.Event()
         self._started = threading.Event()
         self._thread: threading.Thread | None = None
@@ -330,10 +346,16 @@ class ConsumerControlServer:
                         except zmq.Again:
                             break
                         pending_events.popleft()
+
+                    def publish_store_ready() -> None:
+                        for ready_id in self._poll_store():
+                            queue_ready(ready_id)
+
                     now = time.monotonic()
                     if now - last_reap_at >= _RESERVATION_REAP_INTERVAL_SECONDS:
                         self._reap()
                         last_reap_at = now
+                    publish_store_ready()
                     try:
                         request = socket.recv_json()
                     except zmq.Again:
@@ -378,6 +400,8 @@ class ConsumerControlServer:
                             result = self.event_port
                         elif op == "peers":
                             result = {"ports": self.peer_ports}
+                            if self.capabilities:
+                                result["capabilities"] = list(self.capabilities)
                         elif op in ("complete", "complete_batch"):
                             items = (
                                 request["items"]
@@ -417,6 +441,7 @@ class ConsumerControlServer:
                             }
                         else:
                             raise ValueError(f"unknown control op: {op!r}")
+                        publish_store_ready()
                         socket.send_json({"ok": True, "result": result})
                     except Exception as e:
                         socket.send_json({"ok": False, "error": str(e)})

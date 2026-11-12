@@ -79,10 +79,13 @@ class EncoderRunner:
             self.cudagraph_manager.clear()
 
     def prepare_mm_inputs(
-        self, scheduled_encoder_inputs: dict[str, list[int]]
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        skip_identifiers: set[str] | None = None,
     ) -> tuple[list[str], list[tuple[str, MultiModalKwargsItem]]]:
         mm_hashes: list[str] = []
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]] = []
+        skipped = skip_identifiers or set()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             mm_features = self.encoder_cache.mm_features[req_id]
             for mm_input_id in encoder_input_ids:
@@ -90,6 +93,8 @@ class EncoderRunner:
                 if mm_feature.data is None:
                     continue
                 if mm_feature.identifier in self.encoder_cache.encoder_outputs:
+                    continue
+                if mm_feature.identifier in skipped:
                     continue
                 if mm_feature.modality == "prompt_embeds":
                     # Passthrough modality: the tensor is already in the
