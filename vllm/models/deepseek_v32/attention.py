@@ -214,6 +214,9 @@ class DeepseekV32Attention(MLAAttention):
             # MTP draft steps reuse each token slot's top-k, which ShardQ's
             # compact per-rank layout would break.
             shardq_eligible=not is_mtp_layer,
+            # ShardQ exchanges the v-space output: up-project before
+            # `unshard_out` and halve the all-to-all's bytes.
+            shardq_exchange_value=True,
         )
 
         self.num_local_heads = num_local_heads
@@ -624,7 +627,33 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg, kv_cache, mqa_metadata, self
         )
         if shardq is not None:
-            attn_out = unshard_out(attn_out, shardq, decode_out)
+            # Exchange the v-space output (v_head_dim) instead of the wider
+            # latent: up-project every head of this rank's token shard before
+            # the all-to-all, halving its bytes. Decode rows up-project with
+            # this rank's heads and re-attach after the exchange.
+            decode_v = None
+            if decode_out is not None:
+                dn = decode_out.shape[0]
+                decode_v = decode_out.new_empty(
+                    (dn, self.num_local_heads, self.v_head_dim)
+                )
+                torch.bmm(
+                    decode_out.view(
+                        dn, self.num_local_heads, self.kv_lora_rank
+                    ).transpose(0, 1),
+                    self.W_UV,
+                    out=decode_v.transpose(0, 1),
+                )
+            num_pre, num_all_heads = attn_out.shape[:2]
+            v = attn_out.new_empty((num_pre, num_all_heads, self.v_head_dim))
+            torch.bmm(
+                attn_out.view(num_pre, num_all_heads, self.kv_lora_rank).transpose(
+                    0, 1
+                ),
+                self.W_UV_shardq,
+                out=v.transpose(0, 1),
+            )
+            attn_out = unshard_out(v, shardq, decode_v)
 
         if self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
@@ -668,17 +697,24 @@ class DeepseekV32Attention(MLAAttention):
             if self.use_pcp:
                 attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-        # NOTE(woosuk): While the below does not need to be in the eager region,
-        # we put it here to avoid copying the attention output. Move this back to the
-        # captured region once forward_mqa supports `out` argument.
-        x = attn_out.view(
-            num_actual, self.num_local_heads, self.kv_lora_rank
-        ).transpose(0, 1)
-        out = (
-            output[:num_actual]
-            .view(num_actual, self.num_local_heads, self.v_head_dim)
-            .transpose(0, 1)
-        )
-        torch.bmm(x, self.W_UV, out=out)
+        if shardq is not None:
+            # The exchange already carried v-space rows; land them in `output`.
+            output[:num_actual].view(
+                num_actual, self.num_local_heads, self.v_head_dim
+            ).copy_(attn_out)
+        else:
+            # NOTE(woosuk): While the below does not need to be in the eager
+            # region, we put it here to avoid copying the attention output.
+            # Move this back to the captured region once forward_mqa supports
+            # `out` argument.
+            x = attn_out.view(
+                num_actual, self.num_local_heads, self.kv_lora_rank
+            ).transpose(0, 1)
+            out = (
+                output[:num_actual]
+                .view(num_actual, self.num_local_heads, self.v_head_dim)
+                .transpose(0, 1)
+            )
+            torch.bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()

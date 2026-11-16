@@ -163,3 +163,105 @@ def test_shard_q_round_trip(use_sm, q_dtype, num_decode_tokens):
         args=(world, get_open_port(), use_sm, q_dtype, num_decode_tokens),
         nprocs=world,
     )
+
+
+def _v_up_exchange(rank, world, port, use_sm, exchange_value, num_decode_tokens):
+    torch.accelerator.set_device_index(rank)
+    device = torch.device(current_platform.device_type, rank)
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            local_rank=rank,
+            backend=current_platform.dist_backend,
+        )
+        ensure_model_parallel_initialized(world, 1)
+        torch.manual_seed(0)
+        lens = [700, 64, 3001]
+        heads, dim, latent, v_dim = 4, 576, 512, 128
+        num_tokens = num_decode_tokens + sum(lens)
+        vllm_config.scheduler_config.max_num_batched_tokens = num_tokens
+        if use_sm:
+            allocate_shardq_buffers(
+                vllm_config,
+                heads,
+                dim,
+                v_dim if exchange_value else latent,
+                torch.bfloat16,
+                torch.bfloat16,
+            )
+        all_heads = world * heads
+        # Integer-valued bf16: the fp32-accumulated bmm and the fp64 reference
+        # both stay exact, so the two orders must agree bitwise.
+        full = torch.randint(
+            -8, 8, (num_tokens - num_decode_tokens, all_heads, latent), device=device
+        ).bfloat16()
+        full_decode = torch.randint(
+            -8, 8, (num_decode_tokens, all_heads, latent), device=device
+        ).bfloat16()
+        w_uv = torch.randint(
+            -4, 4, (all_heads, latent, v_dim), device=device
+        ).bfloat16()
+        w_local = w_uv[rank * heads : (rank + 1) * heads]
+        token_ids, num_tokens_per_rank = zigzag_split(np.array(lens), world)
+        shardq = ShardQMetadata(
+            num_decode_tokens=num_decode_tokens,
+            num_tokens_per_rank=num_tokens_per_rank.tolist(),
+            token_ids=torch.from_numpy(token_ids).to(device),
+            rank_offsets=torch.from_numpy(np.r_[0, np.cumsum(num_tokens_per_rank)]).to(
+                device
+            ),
+        )
+        local = full[shardq.local_token_ids]
+        decode_local = full_decode[:, rank * heads : (rank + 1) * heads].contiguous()
+        if exchange_value:
+            # Up-project every head on the token shard, then exchange v-space.
+            v = local.new_empty((local.shape[0], all_heads, v_dim))
+            torch.bmm(local.transpose(0, 1), w_uv, out=v.transpose(0, 1))
+            decode_v = None
+            if num_decode_tokens:
+                decode_v = decode_local.new_empty((num_decode_tokens, heads, v_dim))
+                torch.bmm(
+                    decode_local.transpose(0, 1), w_local, out=decode_v.transpose(0, 1)
+                )
+            out = unshard_out(v, shardq, decode_v)
+        else:
+            # Exchange the latent, then up-project this rank's heads.
+            restored = unshard_out(local, shardq, decode_local)
+            x = restored.view(num_tokens, heads, latent).transpose(0, 1)
+            out = restored.new_empty((num_tokens, heads, v_dim))
+            torch.bmm(x, w_local, out=out.transpose(0, 1))
+        expected = torch.empty((num_tokens, heads, v_dim), dtype=torch.float64)
+        expected[num_decode_tokens:] = torch.einsum(
+            "thl,hlv->thv",
+            full[:, rank * heads : (rank + 1) * heads].double().cpu(),
+            w_local.double().cpu(),
+        )
+        if num_decode_tokens:
+            expected[:num_decode_tokens] = torch.einsum(
+                "nhl,hlv->nhv", decode_local.double().cpu(), w_local.double().cpu()
+            )
+        assert out.shape == expected.shape
+        assert torch.equal(out, expected.bfloat16().to(device))
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.mark.parametrize("use_sm", [False, True])
+@pytest.mark.parametrize("exchange_value", [False, True])
+@pytest.mark.parametrize("num_decode_tokens", [0, 33])
+def test_shardq_v_up_exchange_order(use_sm, exchange_value, num_decode_tokens):
+    """Both ShardQ orders produce the same o_proj input: exchanging the
+    latent and up-projecting the local heads, or up-projecting all heads on
+    the token shard and exchanging the v-space output (the narrower exchange
+    the sparse-MLA prefill uses)."""
+    world = 2
+    if torch.accelerator.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    mp.spawn(
+        _v_up_exchange,
+        args=(world, get_open_port(), use_sm, exchange_value, num_decode_tokens),
+        nprocs=world,
+    )

@@ -475,6 +475,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         index_group_builder: "SparseMLAIndexGroupBuilder | None" = None,
         non_causal_multi_token_decode: bool = False,
         shardq_eligible: bool = False,
+        shardq_exchange_value: bool = False,
         sliding_window: int | None = None,
         prefill_backend_cls: type[MLAPrefillBackend] | None = None,
         kv_sharing_target_layer_name: str | None = None,
@@ -623,6 +624,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.impl = impl  # type: ignore[assignment]
         # ShardQ (see vllm.v1.attention.ops.shardq), if the impl supports it.
         self.use_shardq = shardq_eligible and getattr(impl, "use_shardq", False)
+        # Exchange the v-space output (post W_UV) instead of the latent, which
+        # halves the output all-to-all's bytes. The model's forward must then
+        # up-project all heads before `unshard_out`, and every rank holds the
+        # full W_UV (see `W_UV_shardq` in `process_weights_after_loading`).
+        self.shardq_exchange_value = shardq_exchange_value
         if self.use_shardq:
             vllm_config = get_current_vllm_config()
             dtype = vllm_config.model_config.dtype
@@ -634,7 +640,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 vllm_config,
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
-                self.kv_lora_rank,
+                self.v_head_dim if shardq_exchange_value else self.kv_lora_rank,
                 current_platform.fp8_dtype() if fp8_query else dtype,
                 dtype,
             )
@@ -1608,6 +1614,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             replace_parameter(self, "W_UV", W_UV.transpose(0, 1))
             # Convert from (L, N, P) to (N, P, L)
             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0))
+            if self.use_shardq and self.shardq_exchange_value:
+                # ShardQ exchanges the v-space output, so every rank
+                # up-projects all heads (cf. W_UV_dcp for the DCP combine).
+                replace_parameter(
+                    self,
+                    "W_UV_shardq",
+                    get_tp_group().all_gather(self.W_UV.contiguous(), dim=0),
+                )
             if self.dcp_q_replicate:
                 replace_parameter(
                     self,
