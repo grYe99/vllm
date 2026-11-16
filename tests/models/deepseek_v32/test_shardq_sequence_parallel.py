@@ -313,7 +313,19 @@ def test_shardq_keeps_tp_weights_and_projects_local_rows(
                             p == "A" and full > local > 1 for p, full, local in rows
                         )
             outputs.append(runs)
-    assert layouts[0] == layouts[1]
+
+    # Derived replicated buffers (W_UV_shardq for the value-space exchange,
+    # W_UV_dcp / W_UK_T_dcp_qrep for DCP) follow the ShardQ/DCP mode, not the
+    # TP weight sharding this test guards.
+    def tp_params(layout):
+        return {
+            k: v
+            for k, v in layout[6].items()
+            if not k.endswith(("W_UV_shardq", "W_UV_dcp", "W_UK_T_dcp_qrep"))
+        }
+
+    assert layouts[0][:6] == layouts[1][:6]
+    assert tp_params(layouts[0]) == tp_params(layouts[1])
     assert all(len(run.token_ids) == max_tokens for runs in outputs for run in runs)
     check_logprobs_close(
         outputs_0_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[0]],
