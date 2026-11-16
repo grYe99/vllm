@@ -324,8 +324,9 @@ def test_shardq_keeps_tp_weights_and_projects_local_rows(
             if not k.endswith(("W_UV_shardq", "W_UV_dcp", "W_UK_T_dcp_qrep"))
         }
 
-    assert layouts[0][:6] == layouts[1][:6]
-    assert tp_params(layouts[0]) == tp_params(layouts[1])
+    for run_a, run_b in zip(layouts[0], layouts[1], strict=True):
+        assert run_a[:6] == run_b[:6]
+        assert tp_params(run_a) == tp_params(run_b)
     assert all(len(run.token_ids) == max_tokens for runs in outputs for run in runs)
     check_logprobs_close(
         outputs_0_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[0]],
