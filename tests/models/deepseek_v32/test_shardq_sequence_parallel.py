@@ -360,6 +360,7 @@ def test_shardq_value_exchange_matches_tp(
             max_num_batched_tokens=255,
             max_num_seqs=4,
             enable_chunked_prefill=True,
+            block_size=64,
             attention_config={
                 "backend": "FLASHMLA_SPARSE",
                 "sparse_mla_shard_q": use_shardq,
