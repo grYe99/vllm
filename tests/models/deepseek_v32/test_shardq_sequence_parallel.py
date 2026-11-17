@@ -344,12 +344,10 @@ def test_shardq_value_exchange_matches_tp(
     matches the latent exchange end to end, including the mixed prefill and
     decode steps of chunked prefill."""
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    # Chunked steps of 255 tokens then take the value path.
-    monkeypatch.setattr(
-        "vllm.models.deepseek_v32.attention.VALUE_EXCHANGE_MIN_TOKENS", 128
-    )
     sampling = SamplingParams(temperature=0, max_tokens=4, logprobs=16)
-    prompts = [{"prompt_token_ids": [2 + i % 997 for i in range(n)]} for n in (769, 17)]
+    prompts = [
+        {"prompt_token_ids": [2 + i % 997 for i in range(n)]} for n in (769, 100, 17)
+    ]
     outputs: list[list[CompletionOutput]] = []
     for use_shardq in (False, True):
         with vllm_runner(
@@ -374,6 +372,17 @@ def test_shardq_value_exchange_matches_tp(
                 lambda worker: worker.model_runner.model.model.shardq_sequence_parallel
             )
             assert enabled == [use_shardq] * 2
+            if use_shardq:
+                # The gate is lowered inside each worker because spawned
+                # workers do not inherit this process's modules; the 255-token
+                # chunked steps then take the value path while the 100-token
+                # prompt falls back to the latent exchange.
+                def lower_value_gate(worker):
+                    from vllm.models.deepseek_v32 import attention
+
+                    attention.VALUE_EXCHANGE_MIN_TOKENS = 128
+
+                runner.llm.collective_rpc(lower_value_gate)
             result = runner.llm.generate(prompts, sampling, use_tqdm=False)
             outputs.append([r.outputs[0] for r in result])
     assert all(len(run.token_ids) == 4 for runs in outputs for run in runs)
