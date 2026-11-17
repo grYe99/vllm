@@ -601,11 +601,7 @@ def test_byte_budget_resolves_and_updates_workers(budget_bytes, reports, expecte
     )
 
 
-@pytest.mark.parametrize(
-    "ec_transfer, skip_profile, match",
-    [(True, False, "EC transfer"), (False, True, "skip-mm-profiling")],
-)
-def test_byte_budget_rejects_unsupported_modes(ec_transfer, skip_profile, match):
+def test_byte_budget_rejects_skip_mm_profiling():
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -616,16 +612,14 @@ def test_byte_budget_rejects_unsupported_modes(ec_transfer, skip_profile, match)
             scheduler_config=_scheduler_config(
                 max_num_batched_tokens=16384, encoder_cache_bytes=2 << 30
             ),
-            ec_transfer_config=SimpleNamespace(is_ec_transfer_instance=True)
-            if ec_transfer
-            else None,
+            ec_transfer_config=None,
             model_config=SimpleNamespace(
-                multimodal_config=SimpleNamespace(skip_mm_profiling=skip_profile)
+                multimodal_config=SimpleNamespace(skip_mm_profiling=True)
             ),
         ),
         collective_rpc=Mock(),
     )
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match="skip-mm-profiling"):
         EngineCore._resolve_encoder_cache_budget(core)
     core.collective_rpc.assert_not_called()
 

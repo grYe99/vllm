@@ -173,7 +173,8 @@ class EngineCore:
                 self._eep_scale_up_before_kv_init()
 
             self._resolve_encoder_cache_budget()
-            measure_encoder_output_widths(vllm_config, self.collective_rpc)
+            if vllm_config.scheduler_config.encoder_cache_bytes is None:
+                measure_encoder_output_widths(vllm_config, self.collective_rpc)
 
             # Setup KV Caches and update CacheConfig after profiling.
             kv_cache_config = self._initialize_kv_caches(vllm_config)
@@ -289,26 +290,27 @@ class EngineCore:
             return
 
         ec_config = config.ec_transfer_config
-        if ec_config is not None and ec_config.is_ec_transfer_instance:
-            raise ValueError(
-                "--encoder-cache-bytes does not yet support EC transfer."
-            )
         mm_config = config.model_config.multimodal_config
         if mm_config is not None and mm_config.skip_mm_profiling:
             raise ValueError(
                 "--encoder-cache-bytes cannot be combined with --skip-mm-profiling."
             )
 
-        reports = self.collective_rpc("measure_encoder_output_layouts")
-        bytes_per_embedding = max(
-            (
-                width * element_size
-                for report in reports
-                for width, element_size in report.values()
-            ),
-            default=0,
-        )
-        if bytes_per_embedding <= 0:
+        if ec_config is not None and ec_config.is_ec_transfer_instance:
+            bytes_per_embedding = measure_encoder_output_widths(
+                config, self.collective_rpc
+            )
+        else:
+            reports = self.collective_rpc("measure_encoder_output_layouts")
+            bytes_per_embedding = max(
+                (
+                    width * element_size
+                    for report in reports
+                    for width, element_size in report.values()
+                ),
+                default=0,
+            )
+        if not bytes_per_embedding:
             raise ValueError(
                 "--encoder-cache-bytes requires a measured local encoder output."
             )
