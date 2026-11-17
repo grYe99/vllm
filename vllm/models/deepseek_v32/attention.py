@@ -644,9 +644,9 @@ class DeepseekV32Attention(MLAAttention):
             # resident; smaller steps take the latent exchange below, where
             # the T-independent gather would outcost the halved exchange.
             # Decode rows up-project with this rank's heads and re-attach
-            # after the exchange. Zero-copy: o_proj consumes the workspace
-            # view directly; the next exchange's leading barrier orders every
-            # peer's read of the buffer before any reuse.
+            # after the exchange. Like the latent tail, the result lands in
+            # the caller-provided buffer, so whichever branch this eager-break
+            # op takes, a cudagraph replay reads a stable address.
             decode_v = None
             if decode_out is not None:
                 dn = decode_out.shape[0]
@@ -676,7 +676,8 @@ class DeepseekV32Attention(MLAAttention):
                 out=v.transpose(0, 1),
             )
             restored = unshard_out(v, shardq, decode_v)
-            return restored.view(restored.shape[0], -1)
+            output[:num_actual].copy_(restored.view(num_actual, -1))
+            return output
         if shardq is not None:
             attn_out = unshard_out(attn_out, shardq, decode_out)
 

@@ -307,7 +307,12 @@ from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
 )
-from vllm.v1.attention.ops.shardq import allocate_shardq_buffers, shard_q, unshard_out
+from vllm.v1.attention.ops.shardq import (
+    VALUE_EXCHANGE_MIN_TOKENS,
+    allocate_shardq_buffers,
+    shard_q,
+    unshard_out,
+)
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
@@ -638,18 +643,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             # DBO interleaves two streams; the per-step W_UV gather's NCCL
             # ordering under it is unprobed, so the value exchange stays off.
+            # It also needs steps large enough to amortize the T-independent
+            # gather, and a v-space narrower than the latent to save bytes.
             self.shardq_exchange_value = (
-                shardq_exchange_value and vllm_config.parallel_config.num_ubatches <= 1
+                shardq_exchange_value
+                and vllm_config.parallel_config.num_ubatches <= 1
+                and vllm_config.scheduler_config.max_num_batched_tokens
+                >= VALUE_EXCHANGE_MIN_TOKENS
+                and self.v_head_dim < self.kv_lora_rank
             )
             allocate_shardq_buffers(
                 vllm_config,
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
-                self.v_head_dim if self.shardq_exchange_value else self.kv_lora_rank,
+                self.kv_lora_rank,
                 current_platform.fp8_dtype() if fp8_query else dtype,
                 dtype,
-                output_fallback_dim=(
-                    self.kv_lora_rank if self.shardq_exchange_value else None
+                wuv_scratch_dim=(
+                    self.v_head_dim if self.shardq_exchange_value else None
                 ),
             )
             # The indexer follows the split (skip-topk layers have none).

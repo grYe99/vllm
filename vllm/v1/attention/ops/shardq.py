@@ -206,18 +206,11 @@ class ShardQWorkspace(DirectCPWorkspace):
         num_ubatches: int,
         q: tuple[tuple[int, ...], torch.dtype],
         out: tuple[tuple[int, ...], torch.dtype],
-        out_fallback: tuple[tuple[int, ...], torch.dtype] | None = None,
     ) -> None:
         super().__init__(group, device, num_ubatches)
         # Each is its storage and every rank's address of each ubatch slot.
         self.q = self._allocate((num_ubatches, *q[0]), q[1])
         self.out = self._allocate((num_ubatches, *out[0]), out[1])
-        # Steps below VALUE_EXCHANGE_MIN_TOKENS exchange the latent instead.
-        self.out_fallback = (
-            self._allocate((num_ubatches, *out_fallback[0]), out_fallback[1])
-            if out_fallback is not None
-            else None
-        )
         # Any allocation's handle synchronizes the whole group.
         self.handle = self._allocations[0][1]
 
@@ -248,7 +241,7 @@ def allocate_shardq_buffers(
     output_head_dim: int,
     query_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    output_fallback_dim: int | None = None,
+    wuv_scratch_dim: int | None = None,
 ) -> None:
     """Allocate the worst-case exchange buffers, if the TP group has symmetric
     memory. `num_heads` are a TP rank's."""
@@ -262,10 +255,10 @@ def allocate_shardq_buffers(
     device = torch.device(
         current_platform.device_type, torch.accelerator.current_device_index()
     )
-    if output_fallback_dim is not None and _wuv_scratch is None:
+    if wuv_scratch_dim is not None and _wuv_scratch is None:
         # Needed for the value exchange with or without symmetric memory.
         _wuv_scratch = torch.empty(
-            (group.world_size * num_heads, output_fallback_dim, output_head_dim),
+            (group.world_size * num_heads, output_head_dim, wuv_scratch_dim),
             dtype=output_dtype,
             device=device,
         )
@@ -287,11 +280,6 @@ def allocate_shardq_buffers(
             query_dtype,
         ),
         out=((max_num_tokens, num_heads, output_head_dim), output_dtype),
-        out_fallback=(
-            ((max_num_tokens, num_heads, output_fallback_dim), output_dtype)
-            if output_fallback_dim is not None
-            else None
-        ),
     )
 
 
@@ -376,10 +364,7 @@ def unshard_out(
         restored[metadata.num_decode_tokens :].index_copy_(0, metadata.token_ids, recv)
     else:
         storage, peer_ptrs = _workspace.out
-        if _workspace.out_fallback is not None and storage.shape[3] != dim:
-            # A step below VALUE_EXCHANGE_MIN_TOKENS exchanges the latent.
-            storage, peer_ptrs = _workspace.out_fallback
-        assert storage.shape[2:] == (heads, dim)
+        assert storage.shape[2] == heads
         ubatch = dbo_current_ubatch_id()
         width = heads * dim
         _workspace.handle.barrier(channel=ubatch)
@@ -394,8 +379,14 @@ def unshard_out(
             BLOCK=_PUSH_BLOCK,
         )
         _workspace.handle.barrier(channel=ubatch)
-        # Views the buffer, which the next exchange reuses.
-        restored = storage[ubatch, :num_tokens]
+        # Views the buffer, which the next exchange reuses. Value exchanges
+        # pack their narrower rows into the front of the same latent-width
+        # slot, so one allocation serves both widths.
+        slot = storage[ubatch]
+        if dim == storage.shape[3]:
+            restored = slot[:num_tokens]
+        else:
+            restored = slot.view(-1)[: num_tokens * width].view(num_tokens, heads, dim)
     if decode_out is not None:
         restored[: metadata.num_decode_tokens] = decode_out
     return restored

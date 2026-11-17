@@ -188,10 +188,10 @@ def _v_up_exchange(rank, world, port, use_sm, exchange_value, num_decode_tokens)
                 vllm_config,
                 heads,
                 dim,
-                v_dim if exchange_value else latent,
+                latent,
                 torch.bfloat16,
                 torch.bfloat16,
-                output_fallback_dim=latent if exchange_value else None,
+                wuv_scratch_dim=v_dim if exchange_value else None,
             )
         all_heads = world * heads
         # Integer-valued bf16: the fp32-accumulated bmm and the fp64 reference
@@ -247,8 +247,8 @@ def _v_up_exchange(rank, world, port, use_sm, exchange_value, num_decode_tokens)
         assert out.shape == expected.shape
         assert torch.equal(out, expected.bfloat16().to(device))
         if use_sm and exchange_value:
-            # Small steps exchange the latent through the fallback-width slot
-            # of the same workspace.
+            # A later small step exchanges the latent through the same slot
+            # the value exchange packed its narrower rows into.
             restored = unshard_out(local, shardq, decode_local)
             x = restored.view(num_tokens, heads, latent).transpose(0, 1)
             out_latent = restored.new_empty((num_tokens, heads, v_dim))

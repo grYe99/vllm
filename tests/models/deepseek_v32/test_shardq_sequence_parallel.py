@@ -43,7 +43,7 @@ def shardq_checkpoint(tmp_path_factory):
         index_n_heads=32,
         index_head_dim=128,
         index_topk=512,
-        max_position_embeddings=8192,
+        max_position_embeddings=16384,
         first_k_dense_replace=1,
         scoring_func="sigmoid",
         topk_method="noaux_tc",
@@ -314,18 +314,7 @@ def test_shardq_keeps_tp_weights_and_projects_local_rows(
                         )
             outputs.append(runs)
 
-    # Derived replicated buffers (W_UV_dcp / W_UK_T_dcp_qrep for DCP) follow
-    # the ShardQ/DCP mode, not the TP weight sharding this test guards.
-    def tp_params(layout):
-        return {
-            k: v
-            for k, v in layout[6].items()
-            if not k.endswith(("W_UV_dcp", "W_UK_T_dcp_qrep"))
-        }
-
-    for run_a, run_b in zip(layouts[0], layouts[1], strict=True):
-        assert run_a[:6] == run_b[:6]
-        assert tp_params(run_a) == tp_params(run_b)
+    assert layouts[0] == layouts[1]
     assert all(len(run.token_ids) == max_tokens for runs in outputs for run in runs)
     check_logprobs_close(
         outputs_0_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[0]],
@@ -341,12 +330,24 @@ def test_shardq_value_exchange_matches_tp(
     monkeypatch,
 ):
     """The value-space exchange (per-step W_UV gather, v-space all-to-all)
-    matches the latent exchange end to end, including the mixed prefill and
-    decode steps of chunked prefill."""
+    matches the latent exchange end to end under breakable cudagraphs,
+    including a step that replays a value-exchange capture while skipping
+    ShardQ, and a step that falls back to the latent exchange."""
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     sampling = SamplingParams(temperature=0, max_tokens=4, logprobs=16)
-    prompts = [
-        {"prompt_token_ids": [2 + i % 997 for i in range(n)]} for n in (769, 100, 17)
+
+    def ids(n):
+        return [2 + i % 997 for i in range(n)]
+
+    # Batch 1 step 2 runs 11 + 100 + 17 = 128 tokens with a >512 request:
+    # the value exchange, captured. Batch 2 runs the same 128 tokens from
+    # short requests only, so its step skips ShardQ and replays that capture
+    # under the other branch. Batch 3 step 2 runs 125 tokens: the latent
+    # exchange.
+    batches = [
+        [{"prompt_token_ids": ids(n)} for n in (8203, 100, 17)],
+        [{"prompt_token_ids": ids(n)} for n in (100, 17, 11)],
+        [{"prompt_token_ids": ids(n)} for n in (8200, 100, 17)],
     ]
     outputs: list[list[CompletionOutput]] = []
     for use_shardq in (False, True):
@@ -356,11 +357,12 @@ def test_shardq_value_exchange_matches_tp(
             enable_expert_parallel=True,
             skip_tokenizer_init=True,
             dtype="bfloat16",
-            max_model_len=1024,
-            max_num_batched_tokens=255,
+            enforce_eager=False,
+            max_model_len=8448,
+            max_num_batched_tokens=8192,
             max_num_seqs=4,
             enable_chunked_prefill=True,
-            block_size=64,
+            enable_prefix_caching=False,
             attention_config={
                 "backend": "FLASHMLA_SPARSE",
                 "sparse_mla_shard_q": use_shardq,
@@ -369,23 +371,50 @@ def test_shardq_value_exchange_matches_tp(
             gpu_memory_utilization=0.1,
             kv_cache_dtype="fp8_ds_mla",
         ) as runner:
+
+            def breakable_on(worker):
+                compilation = worker.model_runner.vllm_config.compilation_config
+                return (
+                    not worker.model_runner.model_config.enforce_eager
+                    and compilation.use_breakable_cudagraph
+                )
+
+            if not all(runner.llm.collective_rpc(breakable_on)):
+                pytest.skip("breakable cudagraphs off; replay untested")
             enabled = runner.llm.collective_rpc(
                 lambda worker: worker.model_runner.model.model.shardq_sequence_parallel
             )
             assert enabled == [use_shardq] * 2
             if use_shardq:
-                # The gate is lowered inside each worker because spawned
-                # workers do not inherit this process's modules; the 255-token
-                # chunked steps then take the value path while the 100-token
-                # prompt falls back to the latent exchange.
+                # The gate is lowered and the exchanges observed inside each
+                # worker because spawned workers do not inherit this
+                # process's modules.
                 def lower_value_gate(worker):
                     from vllm.models.deepseek_v32 import attention
 
                     attention.VALUE_EXCHANGE_MIN_TOKENS = 128
+                    worker.shardq_exchange_widths = []
+                    unshard = attention.unshard_out
+
+                    def observe(out, metadata, decode_out):
+                        worker.shardq_exchange_widths.append(out.shape[2])
+                        return unshard(out, metadata, decode_out)
+
+                    attention.unshard_out = observe
 
                 runner.llm.collective_rpc(lower_value_gate)
-            result = runner.llm.generate(prompts, sampling, use_tqdm=False)
-            outputs.append([r.outputs[0] for r in result])
+            runs: list[CompletionOutput] = []
+            for batch in batches:
+                result = runner.llm.generate(batch, sampling, use_tqdm=False)
+                runs.extend(r.outputs[0] for r in result)
+            if use_shardq:
+                for widths in runner.llm.collective_rpc(
+                    lambda worker: set(worker.shardq_exchange_widths)
+                ):
+                    # The value (v_head_dim) and latent (kv_lora_rank)
+                    # exchanges both ran.
+                    assert widths == {128, 512}, widths
+            outputs.append(runs)
     assert all(len(run.token_ids) == 4 for runs in outputs for run in runs)
     check_logprobs_close(
         outputs_0_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[0]],
