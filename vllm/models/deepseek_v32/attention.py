@@ -464,7 +464,7 @@ class DeepseekV32Attention(MLAAttention):
             quantize_mqa=self._fp8_query and prepare_mqa_query,
         )
 
-        self._sparse_indexer_and_attn(
+        output = self._sparse_indexer_and_attn(
             positions,
             q_c,
             q_nope,
@@ -495,7 +495,7 @@ class DeepseekV32Attention(MLAAttention):
         ql_nope: torch.Tensor,
         mqa_q: torch.Tensor,
         output: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
@@ -542,7 +542,7 @@ class DeepseekV32Attention(MLAAttention):
         )
         if attn_metadata is None:
             output.zero_()
-            return
+            return output
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
         self.impl.prepare_for_batch(attn_metadata)
 
@@ -572,7 +572,7 @@ class DeepseekV32Attention(MLAAttention):
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
         if num_actual == 0:
             output.zero_()
-            return
+            return output
 
         if self._use_sparse_mha(attn_metadata):
             assert kv_c is not None and k_pe is not None
@@ -590,7 +590,7 @@ class DeepseekV32Attention(MLAAttention):
                 attn_metadata,
                 output,
             )
-            return
+            return output
 
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
@@ -654,6 +654,10 @@ class DeepseekV32Attention(MLAAttention):
                 out=v.transpose(0, 1),
             )
             attn_out = unshard_out(v, shardq, decode_v)
+            # Zero-copy: o_proj consumes the workspace view directly. The
+            # next exchange's leading barrier orders every peer's read of
+            # the buffer before any reuse, so the view can be handed out.
+            return attn_out.view(attn_out.shape[0], -1)
 
         if self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
@@ -697,24 +701,19 @@ class DeepseekV32Attention(MLAAttention):
             if self.use_pcp:
                 attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-        if shardq is not None:
-            # The exchange already carried v-space rows; land them in `output`.
-            output[:num_actual].view(
-                num_actual, self.num_local_heads, self.v_head_dim
-            ).copy_(attn_out)
-        else:
-            # NOTE(woosuk): While the below does not need to be in the eager
-            # region, we put it here to avoid copying the attention output.
-            # Move this back to the captured region once forward_mqa supports
-            # `out` argument.
-            x = attn_out.view(
-                num_actual, self.num_local_heads, self.kv_lora_rank
-            ).transpose(0, 1)
-            out = (
-                output[:num_actual]
-                .view(num_actual, self.num_local_heads, self.v_head_dim)
-                .transpose(0, 1)
-            )
-            torch.bmm(x, self.W_UV, out=out)
+        # NOTE(woosuk): While the below does not need to be in the eager
+        # region, we put it here to avoid copying the attention output.
+        # Move this back to the captured region once forward_mqa supports
+        # `out` argument.
+        x = attn_out.view(
+            num_actual, self.num_local_heads, self.kv_lora_rank
+        ).transpose(0, 1)
+        out = (
+            output[:num_actual]
+            .view(num_actual, self.num_local_heads, self.v_head_dim)
+            .transpose(0, 1)
+        )
+        torch.bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()
+        return output
