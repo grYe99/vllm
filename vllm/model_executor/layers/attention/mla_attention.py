@@ -625,9 +625,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # ShardQ (see vllm.v1.attention.ops.shardq), if the impl supports it.
         self.use_shardq = shardq_eligible and getattr(impl, "use_shardq", False)
         # Exchange the v-space output (post W_UV) instead of the latent, which
-        # halves the output all-to-all's bytes. The model's forward must then
-        # up-project all heads before `unshard_out`, and every rank holds the
-        # full W_UV (see `W_UV_shardq` in `process_weights_after_loading`).
+        # halves the output all-to-all's bytes. The model's forward then
+        # up-projects all heads before `unshard_out`, gathering the full W_UV
+        # into a shared scratch on each such step (see `shardq.wuv_scratch`).
         self.shardq_exchange_value = shardq_exchange_value
         if self.use_shardq:
             vllm_config = get_current_vllm_config()
@@ -636,13 +636,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 is_quantized_kv_cache(self.kv_cache_dtype)
                 and self.impl.supports_quant_query_input
             )
+            # DBO interleaves two streams; the per-step W_UV gather's NCCL
+            # ordering under it is unprobed, so the value exchange stays off.
+            self.shardq_exchange_value = (
+                shardq_exchange_value and vllm_config.parallel_config.num_ubatches <= 1
+            )
             allocate_shardq_buffers(
                 vllm_config,
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
-                self.v_head_dim if shardq_exchange_value else self.kv_lora_rank,
+                self.v_head_dim if self.shardq_exchange_value else self.kv_lora_rank,
                 current_platform.fp8_dtype() if fp8_query else dtype,
                 dtype,
+                output_fallback_dim=(
+                    self.kv_lora_rank if self.shardq_exchange_value else None
+                ),
             )
             # The indexer follows the split (skip-topk layers have none).
             indexer_op = getattr(indexer, "indexer_op", None)
@@ -1614,14 +1622,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             replace_parameter(self, "W_UV", W_UV.transpose(0, 1))
             # Convert from (L, N, P) to (N, P, L)
             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0))
-            if self.use_shardq and self.shardq_exchange_value:
-                # ShardQ exchanges the v-space output, so every rank
-                # up-projects all heads (cf. W_UV_dcp for the DCP combine).
-                replace_parameter(
-                    self,
-                    "W_UV_shardq",
-                    get_tp_group().all_gather(self.W_UV.contiguous(), dim=0),
-                )
             if self.dcp_q_replicate:
                 replace_parameter(
                     self,

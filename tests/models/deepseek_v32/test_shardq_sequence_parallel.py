@@ -314,14 +314,13 @@ def test_shardq_keeps_tp_weights_and_projects_local_rows(
                         )
             outputs.append(runs)
 
-    # Derived replicated buffers (W_UV_shardq for the value-space exchange,
-    # W_UV_dcp / W_UK_T_dcp_qrep for DCP) follow the ShardQ/DCP mode, not the
-    # TP weight sharding this test guards.
+    # Derived replicated buffers (W_UV_dcp / W_UK_T_dcp_qrep for DCP) follow
+    # the ShardQ/DCP mode, not the TP weight sharding this test guards.
     def tp_params(layout):
         return {
             k: v
             for k, v in layout[6].items()
-            if not k.endswith(("W_UV_shardq", "W_UV_dcp", "W_UK_T_dcp_qrep"))
+            if not k.endswith(("W_UV_dcp", "W_UK_T_dcp_qrep"))
         }
 
     for run_a, run_b in zip(layouts[0], layouts[1], strict=True):
@@ -333,4 +332,54 @@ def test_shardq_keeps_tp_weights_and_projects_local_rows(
         outputs_1_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[1]],
         name_0="TP",
         name_1="TP with extended ShardQ",
+    )
+
+
+def test_shardq_value_exchange_matches_tp(
+    vllm_runner,
+    shardq_checkpoint,
+    monkeypatch,
+):
+    """The value-space exchange (per-step W_UV gather, v-space all-to-all)
+    matches the latent exchange end to end, including the mixed prefill and
+    decode steps of chunked prefill."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # Chunked steps of 255 tokens then take the value path.
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.attention.VALUE_EXCHANGE_MIN_TOKENS", 128
+    )
+    sampling = SamplingParams(temperature=0, max_tokens=4, logprobs=16)
+    prompts = [{"prompt_token_ids": [2 + i % 997 for i in range(n)]} for n in (769, 17)]
+    outputs: list[list[CompletionOutput]] = []
+    for use_shardq in (False, True):
+        with vllm_runner(
+            shardq_checkpoint,
+            tensor_parallel_size=2,
+            enable_expert_parallel=True,
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            max_model_len=1024,
+            max_num_batched_tokens=255,
+            max_num_seqs=4,
+            enable_chunked_prefill=True,
+            attention_config={
+                "backend": "FLASHMLA_SPARSE",
+                "sparse_mla_shard_q": use_shardq,
+                "sparse_mla_shard_q_min_tokens": 64,
+            },
+            gpu_memory_utilization=0.1,
+            kv_cache_dtype="fp8_ds_mla",
+        ) as runner:
+            enabled = runner.llm.collective_rpc(
+                lambda worker: worker.model_runner.model.model.shardq_sequence_parallel
+            )
+            assert enabled == [use_shardq] * 2
+            result = runner.llm.generate(prompts, sampling, use_tqdm=False)
+            outputs.append([r.outputs[0] for r in result])
+    assert all(len(run.token_ids) == 4 for runs in outputs for run in runs)
+    check_logprobs_close(
+        outputs_0_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[0]],
+        outputs_1_lst=[(list(r.token_ids), "", r.logprobs) for r in outputs[1]],
+        name_0="TP",
+        name_1="TP with value-space ShardQ exchange",
     )

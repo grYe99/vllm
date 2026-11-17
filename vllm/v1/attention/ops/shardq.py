@@ -206,17 +206,39 @@ class ShardQWorkspace(DirectCPWorkspace):
         num_ubatches: int,
         q: tuple[tuple[int, ...], torch.dtype],
         out: tuple[tuple[int, ...], torch.dtype],
+        out_fallback: tuple[tuple[int, ...], torch.dtype] | None = None,
     ) -> None:
         super().__init__(group, device, num_ubatches)
         # Each is its storage and every rank's address of each ubatch slot.
         self.q = self._allocate((num_ubatches, *q[0]), q[1])
         self.out = self._allocate((num_ubatches, *out[0]), out[1])
+        # Steps below VALUE_EXCHANGE_MIN_TOKENS exchange the latent instead.
+        self.out_fallback = (
+            self._allocate((num_ubatches, *out_fallback[0]), out_fallback[1])
+            if out_fallback is not None
+            else None
+        )
         # Any allocation's handle synchronizes the whole group.
         self.handle = self._allocations[0][1]
 
 
 # Shared by every ShardQ layer; without it the exchanges use NCCL.
 _workspace: ShardQWorkspace | None = None
+
+# Value-exchange steps up-project every head before the output all-to-all,
+# halving its bytes; that needs the full W_UV, gathered into a shared scratch
+# on each such step. Below this many prefill tokens per step the gather
+# (latency is T-independent, ~70us at TP8) outcosts the halved exchange, so
+# such steps fall back to the latent exchange.
+VALUE_EXCHANGE_MIN_TOKENS = 8192
+
+# Full W_UV [world * local_heads, kv_lora_rank, v_head_dim].
+_wuv_scratch: torch.Tensor | None = None
+
+
+def wuv_scratch() -> torch.Tensor:
+    assert _wuv_scratch is not None, "allocate_shardq_buffers was not called"
+    return _wuv_scratch
 
 
 def allocate_shardq_buffers(
@@ -226,6 +248,7 @@ def allocate_shardq_buffers(
     output_head_dim: int,
     query_dtype: torch.dtype,
     output_dtype: torch.dtype,
+    output_fallback_dim: int | None = None,
 ) -> None:
     """Allocate the worst-case exchange buffers, if the TP group has symmetric
     memory. `num_heads` are a TP rank's."""
@@ -234,8 +257,18 @@ def allocate_shardq_buffers(
         "token (sparse_mla_shard_q).",
         vllm_config.attention_config.sparse_mla_shard_q_min_tokens,
     )
-    global _workspace
+    global _workspace, _wuv_scratch
     group = get_tp_group()
+    device = torch.device(
+        current_platform.device_type, torch.accelerator.current_device_index()
+    )
+    if output_fallback_dim is not None and _wuv_scratch is None:
+        # Needed for the value exchange with or without symmetric memory.
+        _wuv_scratch = torch.empty(
+            (group.world_size * num_heads, output_fallback_dim, output_head_dim),
+            dtype=output_dtype,
+            device=device,
+        )
     if _workspace is not None or not direct_cp_enabled(group, torch.bfloat16, None):
         return
     max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -245,9 +278,6 @@ def allocate_shardq_buffers(
         + 2 * vllm_config.scheduler_config.max_num_seqs
     )
     num_ubatches = max(vllm_config.parallel_config.num_ubatches, 1)
-    device = torch.device(
-        current_platform.device_type, torch.accelerator.current_device_index()
-    )
     _workspace = ShardQWorkspace(
         group.device_group,
         device,
@@ -257,6 +287,11 @@ def allocate_shardq_buffers(
             query_dtype,
         ),
         out=((max_num_tokens, num_heads, output_head_dim), output_dtype),
+        out_fallback=(
+            ((max_num_tokens, num_heads, output_fallback_dim), output_dtype)
+            if output_fallback_dim is not None
+            else None
+        ),
     )
 
 
@@ -341,6 +376,9 @@ def unshard_out(
         restored[metadata.num_decode_tokens :].index_copy_(0, metadata.token_ids, recv)
     else:
         storage, peer_ptrs = _workspace.out
+        if _workspace.out_fallback is not None and storage.shape[3] != dim:
+            # A step below VALUE_EXCHANGE_MIN_TOKENS exchanges the latent.
+            storage, peer_ptrs = _workspace.out_fallback
         assert storage.shape[2:] == (heads, dim)
         ubatch = dbo_current_ubatch_id()
         width = heads * dim

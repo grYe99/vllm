@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
@@ -42,7 +43,12 @@ from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
 )
-from vllm.v1.attention.ops.shardq import shard_q, unshard_out
+from vllm.v1.attention.ops.shardq import (
+    VALUE_EXCHANGE_MIN_TOKENS,
+    shard_q,
+    unshard_out,
+    wuv_scratch,
+)
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 if TYPE_CHECKING:
@@ -626,11 +632,21 @@ class DeepseekV32Attention(MLAAttention):
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, mqa_metadata, self
         )
-        if shardq is not None:
+        if (
+            shardq is not None
+            and self.shardq_exchange_value
+            and sum(shardq.num_tokens_per_rank) >= VALUE_EXCHANGE_MIN_TOKENS
+        ):
             # Exchange the v-space output (v_head_dim) instead of the wider
             # latent: up-project every head of this rank's token shard before
-            # the all-to-all, halving its bytes. Decode rows up-project with
-            # this rank's heads and re-attach after the exchange.
+            # the all-to-all, halving its bytes. The full W_UV is gathered
+            # into a shared scratch on each such step, so nothing extra stays
+            # resident; smaller steps take the latent exchange below, where
+            # the T-independent gather would outcost the halved exchange.
+            # Decode rows up-project with this rank's heads and re-attach
+            # after the exchange. Zero-copy: o_proj consumes the workspace
+            # view directly; the next exchange's leading barrier orders every
+            # peer's read of the buffer before any reuse.
             decode_v = None
             if decode_out is not None:
                 dn = decode_out.shape[0]
@@ -644,20 +660,25 @@ class DeepseekV32Attention(MLAAttention):
                     self.W_UV,
                     out=decode_v.transpose(0, 1),
                 )
+            scratch = wuv_scratch()
+            dist.all_gather_into_tensor(
+                scratch.view(-1),
+                self.W_UV.contiguous().view(-1),
+                group=get_tp_group().device_group,
+            )
             num_pre, num_all_heads = attn_out.shape[:2]
             v = attn_out.new_empty((num_pre, num_all_heads, self.v_head_dim))
             torch.bmm(
                 attn_out.view(num_pre, num_all_heads, self.kv_lora_rank).transpose(
                     0, 1
                 ),
-                self.W_UV_shardq,
+                scratch,
                 out=v.transpose(0, 1),
             )
-            attn_out = unshard_out(v, shardq, decode_v)
-            # Zero-copy: o_proj consumes the workspace view directly. The
-            # next exchange's leading barrier orders every peer's read of
-            # the buffer before any reuse, so the view can be handed out.
-            return attn_out.view(attn_out.shape[0], -1)
+            restored = unshard_out(v, shardq, decode_v)
+            return restored.view(restored.shape[0], -1)
+        if shardq is not None:
+            attn_out = unshard_out(attn_out, shardq, decode_out)
 
         if self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
