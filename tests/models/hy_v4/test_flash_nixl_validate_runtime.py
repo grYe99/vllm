@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.models.hy_v4_flash.nvidia.model import validate_runtime
 
 
@@ -31,9 +32,58 @@ def _minimal_vllm_config(*, kv_transfer_config=None, lora_config=None):
 @patch(
     "vllm.models.hy_v4_flash.nvidia.model.current_platform.is_cuda", return_value=True
 )
-def test_validate_runtime_allows_nixl_kv_transfer(_mock_cuda):
-    cfg = _minimal_vllm_config(kv_transfer_config=MagicMock())
-    validate_runtime(cfg)
+def test_validate_runtime_without_kv_transfer(_mock_cuda):
+    validate_runtime(_minimal_vllm_config())
+
+
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    ("connector", "extra_config"),
+    [
+        ("NixlConnector", {}),
+        ("NixlConnector", {"transfer_mode": "pull"}),
+        ("NixlPullConnector", {}),
+    ],
+)
+@patch(
+    "vllm.models.hy_v4_flash.nvidia.model.current_platform.is_cuda", return_value=True
+)
+def test_validate_runtime_allows_nixl_pull(_mock_cuda, connector, extra_config, kv_role):
+    kv_transfer = KVTransferConfig(
+        kv_connector=connector,
+        kv_connector_extra_config=extra_config,
+        kv_role=kv_role,
+    )
+    validate_runtime(_minimal_vllm_config(kv_transfer_config=kv_transfer))
+
+
+@pytest.mark.parametrize(
+    ("connector", "extra_config", "module_path"),
+    [
+        ("NixlConnector", {"transfer_mode": "push"}, None),
+        ("NixlConnector", {"transfer_mode": "invalid"}, None),
+        ("NixlPushConnector", {}, None),
+        ("MooncakeConnector", {}, None),
+        ("DecodeBenchConnector", {}, None),
+        ("MultiConnector", {}, None),
+        ("NixlConnector", {}, "external_connector"),
+        ("NixlPullConnector", {}, "external_connector"),
+    ],
+)
+@patch(
+    "vllm.models.hy_v4_flash.nvidia.model.current_platform.is_cuda", return_value=True
+)
+def test_validate_runtime_rejects_other_kv_connectors(
+    _mock_cuda, connector, extra_config, module_path
+):
+    kv_transfer = KVTransferConfig(
+        kv_connector=connector,
+        kv_connector_extra_config=extra_config,
+        kv_connector_module_path=module_path,
+        kv_role="kv_producer",
+    )
+    with pytest.raises(ValueError, match="supports only NIXL pull KV transfer"):
+        validate_runtime(_minimal_vllm_config(kv_transfer_config=kv_transfer))
 
 
 @patch(
