@@ -178,11 +178,12 @@ def setup_cuda():
     "H200" not in torch.cuda.get_device_name(),
     reason="The sorted-A TMA path is tuned for H200",
 )
-def test_sorted_a_tma_moe_matches_route_major(workspace_init):
+@pytest.mark.parametrize(("clamp_limit", "input_scale"), [(None, 0.1), (10.0, 2.5)])
+def test_sorted_a_tma_moe_matches_route_major(workspace_init, clamp_limit, input_scale):
     """The H200 sorted path preserves routed FP8 block outputs exactly."""
     torch.manual_seed(123)
     m, experts, hidden, intermediate, topk = 1024, 256, 4096, 256, 8
-    x = (torch.randn((m, hidden)) / 10).to(torch.bfloat16)
+    x = (torch.randn((m, hidden)) * input_scale).to(torch.bfloat16)
     w1, w2, quant_config = make_test_quant_config(
         experts,
         intermediate,
@@ -198,6 +199,7 @@ def test_sorted_a_tma_moe_matches_route_major(workspace_init):
         intermediate_size=intermediate,
         max_num_tokens=m,
     )
+    moe_config.swiglu_limit = clamp_limit
     kernel = modular_triton_fused_moe(moe_config, quant_config)
     triton_experts = kernel.fused_experts
     assert isinstance(triton_experts, triton_moe.TritonExperts)

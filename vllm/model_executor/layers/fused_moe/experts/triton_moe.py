@@ -78,6 +78,7 @@ def _silu_mul_quant_sorted_kernel(
     intermediate: tl.constexpr,
     BLOCK_M: tl.constexpr,
     GROUP_K: tl.constexpr,
+    CLAMP_LIMIT: tl.constexpr,
 ):
     row_start = tl.program_id(0) * BLOCK_M
     if row_start >= tl.load(num_tokens_post_padded_ptr):
@@ -90,6 +91,10 @@ def _silu_mul_quant_sorted_kernel(
     )
     gate = gate.to(tl.float32)
     up = up.to(tl.float32)
+    if CLAMP_LIMIT is not None:
+        gate = tl.minimum(gate, CLAMP_LIMIT)
+        gate = gate.to(input_ptr.dtype.element_ty).to(tl.float32)
+        up = tl.minimum(tl.maximum(up, -CLAMP_LIMIT), CLAMP_LIMIT)
     # match silu_and_mul: round SiLU before multiplying the other half.
     silu = tl.div_rn(gate, 1.0 + tl.extra.cuda.libdevice.exp(-gate))
     silu = silu.to(input_ptr.dtype.element_ty).to(tl.float32)
@@ -460,7 +465,6 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             and tma_down_config.pop("USE_TMA", False)
             and self._enable_sorted_a_tma
             and activation == MoEActivation.SILU
-            and self.activation_config.clamp_limit is None
             and self._lora_context is None
             and not hooked
             and not self.quantization_emulation
@@ -632,6 +636,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 cache2_dim,
                 BLOCK_M=16,
                 GROUP_K=128,
+                CLAMP_LIMIT=self.activation_config.clamp_limit,
             )
         elif (
             activation == MoEActivation.SILU
