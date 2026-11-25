@@ -17,6 +17,7 @@ pub use client::{
     EngineCoreStreamDelivery, EngineCoreStreamOutput, TransportMode,
 };
 pub use error::{Error, Result};
+pub use metrics::set_redhare_kv_cluster;
 pub use transport::{ENGINE_CORE_DEAD_SENTINEL, EngineId};
 
 #[cfg(test)]

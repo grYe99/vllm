@@ -943,8 +943,26 @@ fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
 
+/// `cluster` from `kv_transfer_config.kv_connector_extra_config`, or `"default"`.
+///
+/// Same fallback as `RedhareExtraConfig.from_dict`.
+fn redhare_kv_cluster_from_args(value: &serde_json::Value) -> String {
+    value
+        .get("kv_transfer_config")
+        .and_then(|config| config.get("kv_connector_extra_config"))
+        .and_then(|extra| extra.get("cluster"))
+        .and_then(|cluster| cluster.as_str())
+        .map(str::trim)
+        .filter(|cluster| !cluster.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
 fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {
-    let mut args: SharedRuntimeArgs = serde_json::from_str(value)
+    let raw: serde_json::Value = serde_json::from_str(value)
+        .map_err(|e| format!("invalid JSON arguments: {}", e.as_report()))?;
+    vllm_engine_core_client::set_redhare_kv_cluster(redhare_kv_cluster_from_args(&raw));
+    let mut args: SharedRuntimeArgs = serde_json::from_value(raw)
         .map_err(|e| format!("invalid JSON arguments: {}", e.as_report()))?;
     // --args-json is parsed with serde, so clap's env support does not run for
     // the Python-supervised frontend path.

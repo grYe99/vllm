@@ -3,12 +3,13 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
     CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
     LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
-    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RedhareMetrics,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RedhareEngineLabels, RedhareMetrics,
     RedhareOutcomeLabels, RedharePathLabels, RequestMetrics, SchedulerLogStatsAccumulator,
     SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
@@ -21,6 +22,22 @@ use crate::transport::ConnectedEngine;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
 const WAITING_REASON_DEFERRED: &str = "deferred";
+
+static REDHARE_KV_CLUSTER: OnceLock<String> = OnceLock::new();
+
+/// Record the Redhare `cluster` label for this process.
+///
+/// Python's `RedhareKVConnectorPromMetrics` reads it from
+/// `kv_connector_extra_config["cluster"]`, which is not on the scheduler
+/// stats payload. The frontend sets it once from `--args-json`. A later call
+/// is ignored. Unset means `"default"`, matching `RedhareExtraConfig`.
+pub fn set_redhare_kv_cluster(cluster: impl Into<String>) {
+    let _ = REDHARE_KV_CLUSTER.set(cluster.into());
+}
+
+fn redhare_kv_cluster() -> String {
+    REDHARE_KV_CLUSTER.get().cloned().unwrap_or_else(|| "default".to_string())
+}
 
 /// Cached output-batch metric handles for one model and engine index.
 pub(crate) struct IterationMetricHandles {
@@ -433,9 +450,21 @@ fn record_nixl_stats(handles: &SchedulerStatsHandles, stats: &NixlStats) {
     handles.nixl_num_kv_expired_reqs.inc_by(stats.num_kv_expired_reqs.iter().sum());
 }
 
-fn inc_redhare(counter: &Family<EngineLabels, U64Counter>, labels: &EngineLabels, value: u64) {
+fn redhare_engine_labels(labels: &EngineLabels) -> RedhareEngineLabels {
+    RedhareEngineLabels {
+        model_name: labels.model_name.clone(),
+        engine: labels.engine,
+        kv_cluster: redhare_kv_cluster(),
+    }
+}
+
+fn inc_redhare(
+    counter: &Family<RedhareEngineLabels, U64Counter>,
+    labels: &EngineLabels,
+    value: u64,
+) {
     if value != 0 {
-        counter.get_or_create(labels).inc_by(value);
+        counter.get_or_create(&redhare_engine_labels(labels)).inc_by(value);
     }
 }
 
@@ -450,6 +479,7 @@ fn inc_redhare_path(
             .get_or_create(&RedharePathLabels {
                 model_name: labels.model_name.clone(),
                 engine: labels.engine,
+                kv_cluster: redhare_kv_cluster(),
                 path,
             })
             .inc_by(value);
@@ -457,26 +487,26 @@ fn inc_redhare_path(
 }
 
 fn observe_redhare_us(
-    histogram: &Family<EngineLabels, HistogramMetric, fn() -> HistogramMetric>,
+    histogram: &Family<RedhareEngineLabels, HistogramMetric, fn() -> HistogramMetric>,
     labels: &EngineLabels,
     samples_us: &[u64],
 ) {
     if samples_us.is_empty() {
         return;
     }
-    let histogram = histogram.get_or_create(labels);
+    let histogram = histogram.get_or_create(&redhare_engine_labels(labels));
     for sample_us in samples_us {
         histogram.observe(*sample_us as f64 / 1e6);
     }
 }
 
 fn set_redhare_gauge(
-    gauge: &Family<EngineLabels, U64Gauge>,
+    gauge: &Family<RedhareEngineLabels, U64Gauge>,
     labels: &EngineLabels,
     value: Option<u64>,
 ) {
     if let Some(value) = value {
-        gauge.get_or_create(labels).set(value);
+        gauge.get_or_create(&redhare_engine_labels(labels)).set(value);
     }
 }
 
@@ -843,6 +873,7 @@ fn record_redhare_stats(handles: &SchedulerStatsHandles, stats: &RedhareStats) {
         let histogram = metrics.get_latency_seconds.get_or_create(&RedhareOutcomeLabels {
             model_name: labels.model_name.clone(),
             engine: labels.engine,
+            kv_cluster: redhare_kv_cluster(),
             outcome,
         });
         for sample_us in samples {
@@ -1126,16 +1157,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         expect![[r#"
-            redhare_put_path_total{model_name="model",engine="0",path="remote"} 4
-            redhare_get_bytes_total{model_name="model",engine="0",path="local"} 50
-            redhare_local_admission_bypass_total{model_name="model",engine="0",path="shared_fs"} 3
-            redhare_get_latency_seconds_sum{model_name="model",engine="0",outcome="remote"} 0.002
-            redhare_get_latency_seconds_count{model_name="model",engine="0",outcome="remote"} 1
-            redhare_put_total{model_name="model",engine="0"} 2
-            redhare_get_hit_local_total{model_name="model",engine="0"} 1
-            redhare_put_latency_seconds_sum{model_name="model",engine="0"} 0.004
-            redhare_put_latency_seconds_count{model_name="model",engine="0"} 2
-            redhare_local_objects_current{model_name="model",engine="0"} 7"#]]
+            redhare_put_path_total{model_name="model",engine="0",kv_cluster="default",path="remote"} 4
+            redhare_get_bytes_total{model_name="model",engine="0",kv_cluster="default",path="local"} 50
+            redhare_local_admission_bypass_total{model_name="model",engine="0",kv_cluster="default",path="shared_fs"} 3
+            redhare_get_latency_seconds_sum{model_name="model",engine="0",kv_cluster="default",outcome="remote"} 0.002
+            redhare_get_latency_seconds_count{model_name="model",engine="0",kv_cluster="default",outcome="remote"} 1
+            redhare_put_total{model_name="model",engine="0",kv_cluster="default"} 2
+            redhare_get_hit_local_total{model_name="model",engine="0",kv_cluster="default"} 1
+            redhare_put_latency_seconds_sum{model_name="model",engine="0",kv_cluster="default"} 0.004
+            redhare_put_latency_seconds_count{model_name="model",engine="0",kv_cluster="default"} 2
+            redhare_local_objects_current{model_name="model",engine="0",kv_cluster="default"} 7"#]]
         .assert_eq(&series);
     }
 }

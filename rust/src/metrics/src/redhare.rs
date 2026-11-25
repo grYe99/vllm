@@ -4,10 +4,8 @@
 //! Prometheus families for Redhare connector telemetry.
 //!
 //! Names and buckets match `RedhareKVConnectorPromMetrics` in the Redhare
-//! Python package. The Python series also carry a `kv_cluster` label taken
-//! from connector extra config. That value is not on the scheduler stats
-//! payload, so the Rust series use `model_name` and `engine` only (plus
-//! `outcome` / `path` where the Python metric has those labels).
+//! Python package. `kv_cluster` is the connector extra-config `cluster`
+//! (Python default `"default"`), copied onto every series at record time.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
@@ -26,9 +24,17 @@ fn redhare_latency_histogram() -> Histogram {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RedhareEngineLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub kv_cluster: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RedhareOutcomeLabels {
     pub model_name: String,
     pub engine: u32,
+    pub kv_cluster: String,
     pub outcome: &'static str,
 }
 
@@ -36,64 +42,65 @@ pub struct RedhareOutcomeLabels {
 pub struct RedharePathLabels {
     pub model_name: String,
     pub engine: u32,
+    pub kv_cluster: String,
     pub path: &'static str,
 }
 
-pub type RedhareLatencyFamily = Family<crate::EngineLabels, Histogram, fn() -> Histogram>;
+pub type RedhareLatencyFamily = Family<RedhareEngineLabels, Histogram, fn() -> Histogram>;
 pub type RedhareOutcomeLatencyFamily = Family<RedhareOutcomeLabels, Histogram, fn() -> Histogram>;
 
 /// Families mirroring `RedhareKVConnectorPromMetrics`.
 #[derive(Clone)]
 pub struct RedhareMetrics {
-    pub put: Family<crate::EngineLabels, U64Counter>,
-    pub put_failed: Family<crate::EngineLabels, U64Counter>,
-    pub put_fingerprint_mismatch: Family<crate::EngineLabels, U64Counter>,
-    pub get: Family<crate::EngineLabels, U64Counter>,
-    pub get_hit_local: Family<crate::EngineLabels, U64Counter>,
-    pub get_hit_remote: Family<crate::EngineLabels, U64Counter>,
-    pub get_hit_shared_fs: Family<crate::EngineLabels, U64Counter>,
-    pub get_hit_local_disk: Family<crate::EngineLabels, U64Counter>,
-    pub get_miss: Family<crate::EngineLabels, U64Counter>,
-    pub get_fingerprint_mismatch: Family<crate::EngineLabels, U64Counter>,
-    pub bytes_put: Family<crate::EngineLabels, U64Counter>,
-    pub bytes_get: Family<crate::EngineLabels, U64Counter>,
-    pub local_evictions: Family<crate::EngineLabels, U64Counter>,
-    pub local_tinylfu_protected: Family<crate::EngineLabels, U64Counter>,
-    pub shared_fs_demote: Family<crate::EngineLabels, U64Counter>,
-    pub shared_fs_demote_failed: Family<crate::EngineLabels, U64Counter>,
-    pub local_disk_demote: Family<crate::EngineLabels, U64Counter>,
-    pub local_disk_demote_failed: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_reserve: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_reserve_no_space: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_reserve_failed: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_bind: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_bind_failed: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_free: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_free_failed: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_reserve_reaped: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_evictions: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_window_evictions: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_main_evictions: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_window_promotions: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_tinylfu_protected: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_evicted_bytes: Family<crate::EngineLabels, U64Counter>,
-    pub remote_dram_write_bytes: Family<crate::EngineLabels, U64Counter>,
-    pub connector_save_failed: Family<crate::EngineLabels, U64Counter>,
-    pub connector_load_failed: Family<crate::EngineLabels, U64Counter>,
-    pub connector_chunks_dedup_skipped: Family<crate::EngineLabels, U64Counter>,
-    pub connector_chunks_skipped_unbacked: Family<crate::EngineLabels, U64Counter>,
-    pub connector_chunks_skipped_retention: Family<crate::EngineLabels, U64Counter>,
-    pub connector_save_skipped_behind: Family<crate::EngineLabels, U64Counter>,
-    pub connector_save_cancelled: Family<crate::EngineLabels, U64Counter>,
-    pub connector_load_cancelled: Family<crate::EngineLabels, U64Counter>,
-    pub connector_save_unpublished: Family<crate::EngineLabels, U64Counter>,
-    pub connector_preempt_fence_timeout: Family<crate::EngineLabels, U64Counter>,
-    pub connector_ssm_fp_checked: Family<crate::EngineLabels, U64Counter>,
-    pub connector_ssm_fp_mismatch: Family<crate::EngineLabels, U64Counter>,
-    pub connector_ssm_fp_unsampled: Family<crate::EngineLabels, U64Counter>,
-    pub external_cache_lookup: Family<crate::EngineLabels, U64Counter>,
-    pub external_cache_eligible_tokens: Family<crate::EngineLabels, U64Counter>,
-    pub external_cache_hit_tokens: Family<crate::EngineLabels, U64Counter>,
+    pub put: Family<RedhareEngineLabels, U64Counter>,
+    pub put_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub put_fingerprint_mismatch: Family<RedhareEngineLabels, U64Counter>,
+    pub get: Family<RedhareEngineLabels, U64Counter>,
+    pub get_hit_local: Family<RedhareEngineLabels, U64Counter>,
+    pub get_hit_remote: Family<RedhareEngineLabels, U64Counter>,
+    pub get_hit_shared_fs: Family<RedhareEngineLabels, U64Counter>,
+    pub get_hit_local_disk: Family<RedhareEngineLabels, U64Counter>,
+    pub get_miss: Family<RedhareEngineLabels, U64Counter>,
+    pub get_fingerprint_mismatch: Family<RedhareEngineLabels, U64Counter>,
+    pub bytes_put: Family<RedhareEngineLabels, U64Counter>,
+    pub bytes_get: Family<RedhareEngineLabels, U64Counter>,
+    pub local_evictions: Family<RedhareEngineLabels, U64Counter>,
+    pub local_tinylfu_protected: Family<RedhareEngineLabels, U64Counter>,
+    pub shared_fs_demote: Family<RedhareEngineLabels, U64Counter>,
+    pub shared_fs_demote_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub local_disk_demote: Family<RedhareEngineLabels, U64Counter>,
+    pub local_disk_demote_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_reserve: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_reserve_no_space: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_reserve_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_bind: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_bind_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_free: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_free_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_reserve_reaped: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_evictions: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_window_evictions: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_main_evictions: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_window_promotions: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_tinylfu_protected: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_evicted_bytes: Family<RedhareEngineLabels, U64Counter>,
+    pub remote_dram_write_bytes: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_save_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_load_failed: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_chunks_dedup_skipped: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_chunks_skipped_unbacked: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_chunks_skipped_retention: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_save_skipped_behind: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_save_cancelled: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_load_cancelled: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_save_unpublished: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_preempt_fence_timeout: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_ssm_fp_checked: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_ssm_fp_mismatch: Family<RedhareEngineLabels, U64Counter>,
+    pub connector_ssm_fp_unsampled: Family<RedhareEngineLabels, U64Counter>,
+    pub external_cache_lookup: Family<RedhareEngineLabels, U64Counter>,
+    pub external_cache_eligible_tokens: Family<RedhareEngineLabels, U64Counter>,
+    pub external_cache_hit_tokens: Family<RedhareEngineLabels, U64Counter>,
     pub put_path: Family<RedharePathLabels, U64Counter>,
     pub put_bytes: Family<RedharePathLabels, U64Counter>,
     pub get_bytes: Family<RedharePathLabels, U64Counter>,
@@ -102,27 +109,27 @@ pub struct RedhareMetrics {
     pub transport_read_latency_seconds: RedhareLatencyFamily,
     pub remove_latency_seconds: RedhareLatencyFamily,
     pub get_latency_seconds: RedhareOutcomeLatencyFamily,
-    pub local_objects_current: Family<crate::EngineLabels, U64Gauge>,
-    pub local_bytes_current: Family<crate::EngineLabels, U64Gauge>,
-    pub local_capacity_bytes: Family<crate::EngineLabels, U64Gauge>,
-    pub local_free_bytes: Family<crate::EngineLabels, U64Gauge>,
-    pub kvcache_capacity_bytes: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_slots_current: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_bytes_current: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_window_percent_bps: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_window_slots_current: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_window_bytes_current: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_main_slots_current: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_main_bytes_current: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_capacity_bytes: Family<crate::EngineLabels, U64Gauge>,
-    pub remote_dram_free_bytes: Family<crate::EngineLabels, U64Gauge>,
+    pub local_objects_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub local_bytes_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub local_capacity_bytes: Family<RedhareEngineLabels, U64Gauge>,
+    pub local_free_bytes: Family<RedhareEngineLabels, U64Gauge>,
+    pub kvcache_capacity_bytes: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_slots_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_bytes_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_window_percent_bps: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_window_slots_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_window_bytes_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_main_slots_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_main_bytes_current: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_capacity_bytes: Family<RedhareEngineLabels, U64Gauge>,
+    pub remote_dram_free_bytes: Family<RedhareEngineLabels, U64Gauge>,
 }
 
 fn register_counter(
     registry: &mut Registry,
     name: &'static str,
     help: &'static str,
-) -> Family<crate::EngineLabels, U64Counter> {
+) -> Family<RedhareEngineLabels, U64Counter> {
     let family = Family::default();
     registry.register(name, help, family.clone());
     family
@@ -132,7 +139,7 @@ fn register_gauge(
     registry: &mut Registry,
     name: &'static str,
     help: &'static str,
-) -> Family<crate::EngineLabels, U64Gauge> {
+) -> Family<RedhareEngineLabels, U64Gauge> {
     let family = Family::default();
     registry.register(name, help, family.clone());
     family
