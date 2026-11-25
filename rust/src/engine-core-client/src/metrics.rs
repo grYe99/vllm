@@ -8,13 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vllm_metrics::{
     CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
     LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
-    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RequestMetrics,
-    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RedhareMetrics,
+    RedhareOutcomeLabels, RedharePathLabels, RequestMetrics, SchedulerLogStatsAccumulator,
+    SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
     CachedTokensBySource, KvConnectorStats, MooncakeStats, MooncakeTransferStats,
-    MultiConnectorStats, NixlStats, SchedulerStats,
+    MultiConnectorStats, NixlStats, RedhareStats, SchedulerStats,
 };
 use crate::transport::ConnectedEngine;
 
@@ -105,6 +106,9 @@ struct SchedulerStatsHandles {
     nixl_num_failed_transfers: U64Counter,
     nixl_num_failed_notifications: U64Counter,
     nixl_num_kv_expired_reqs: U64Counter,
+
+    // Redhare connector telemetry, decoded from `kv_connector_stats`.
+    redhare: RedhareMetrics,
 
     // Non-Prometheus interval accumulator for periodic text-log helpers.
     log_stats: SchedulerLogStatsAccumulator,
@@ -232,6 +236,7 @@ fn resolve_scheduler_stats_handles(
             .nixl_num_failed_notifications
             .get_or_create_owned(&labels),
         nixl_num_kv_expired_reqs: metrics.nixl_num_kv_expired_reqs.get_or_create_owned(&labels),
+        redhare: metrics.redhare.clone(),
         labels,
     }
 }
@@ -335,6 +340,7 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
                 record_mooncake_transfer_stats(handles, stats)
             }
             KvConnectorStats::Mooncake(stats) => record_mooncake_stats(handles, stats),
+            KvConnectorStats::Redhare(stats) => record_redhare_stats(handles, stats),
             KvConnectorStats::Multi(stats) => record_multi_connector_stats(handles, stats),
             KvConnectorStats::Other(_) => {}
         }
@@ -350,6 +356,9 @@ fn record_multi_connector_stats(handles: &SchedulerStatsHandles, stats: &MultiCo
     }
     if let Some(mooncake) = &stats.mooncake {
         record_mooncake_stats(handles, mooncake);
+    }
+    if let Some(redhare) = &stats.redhare {
+        record_redhare_stats(handles, redhare);
     }
 }
 
@@ -422,6 +431,424 @@ fn record_nixl_stats(handles: &SchedulerStatsHandles, stats: &NixlStats) {
         .nixl_num_failed_notifications
         .inc_by(stats.num_failed_notifications.iter().sum());
     handles.nixl_num_kv_expired_reqs.inc_by(stats.num_kv_expired_reqs.iter().sum());
+}
+
+fn inc_redhare(counter: &Family<EngineLabels, U64Counter>, labels: &EngineLabels, value: u64) {
+    if value != 0 {
+        counter.get_or_create(labels).inc_by(value);
+    }
+}
+
+fn inc_redhare_path(
+    counter: &Family<RedharePathLabels, U64Counter>,
+    labels: &EngineLabels,
+    path: &'static str,
+    value: u64,
+) {
+    if value != 0 {
+        counter
+            .get_or_create(&RedharePathLabels {
+                model_name: labels.model_name.clone(),
+                engine: labels.engine,
+                path,
+            })
+            .inc_by(value);
+    }
+}
+
+fn observe_redhare_us(
+    histogram: &Family<EngineLabels, HistogramMetric, fn() -> HistogramMetric>,
+    labels: &EngineLabels,
+    samples_us: &[u64],
+) {
+    if samples_us.is_empty() {
+        return;
+    }
+    let histogram = histogram.get_or_create(labels);
+    for sample_us in samples_us {
+        histogram.observe(*sample_us as f64 / 1e6);
+    }
+}
+
+fn set_redhare_gauge(
+    gauge: &Family<EngineLabels, U64Gauge>,
+    labels: &EngineLabels,
+    value: Option<u64>,
+) {
+    if let Some(value) = value {
+        gauge.get_or_create(labels).set(value);
+    }
+}
+
+/// Record one Redhare stats payload. Latencies arrive in microseconds and are
+/// stored in seconds, matching `RedhareKVConnectorPromMetrics.observe`.
+fn record_redhare_stats(handles: &SchedulerStatsHandles, stats: &RedhareStats) {
+    let labels = &handles.labels;
+    let metrics = &handles.redhare;
+    inc_redhare(&metrics.put, labels, stats.put_total);
+    inc_redhare(&metrics.put_failed, labels, stats.put_failed);
+    inc_redhare(
+        &metrics.put_fingerprint_mismatch,
+        labels,
+        stats.put_fingerprint_mismatch,
+    );
+    inc_redhare(&metrics.get, labels, stats.get_total);
+    inc_redhare(&metrics.get_hit_local, labels, stats.get_hit_local);
+    inc_redhare(&metrics.get_hit_remote, labels, stats.get_hit_remote);
+    inc_redhare(&metrics.get_hit_shared_fs, labels, stats.get_hit_shared_fs);
+    inc_redhare(
+        &metrics.get_hit_local_disk,
+        labels,
+        stats.get_hit_local_disk,
+    );
+    inc_redhare(&metrics.get_miss, labels, stats.get_miss);
+    inc_redhare(
+        &metrics.get_fingerprint_mismatch,
+        labels,
+        stats.get_fingerprint_mismatch,
+    );
+    inc_redhare(&metrics.bytes_put, labels, stats.bytes_put);
+    inc_redhare(&metrics.bytes_get, labels, stats.bytes_get);
+    inc_redhare(&metrics.local_evictions, labels, stats.local_evictions);
+    inc_redhare(
+        &metrics.local_tinylfu_protected,
+        labels,
+        stats.local_tinylfu_protected,
+    );
+    inc_redhare(
+        &metrics.shared_fs_demote,
+        labels,
+        stats.shared_fs_demote_total,
+    );
+    inc_redhare(
+        &metrics.shared_fs_demote_failed,
+        labels,
+        stats.shared_fs_demote_failed,
+    );
+    inc_redhare(
+        &metrics.local_disk_demote,
+        labels,
+        stats.local_disk_demote_total,
+    );
+    inc_redhare(
+        &metrics.local_disk_demote_failed,
+        labels,
+        stats.local_disk_demote_failed,
+    );
+    inc_redhare(
+        &metrics.remote_dram_reserve,
+        labels,
+        stats.remote_dram_reserve_total,
+    );
+    inc_redhare(
+        &metrics.remote_dram_reserve_no_space,
+        labels,
+        stats.remote_dram_reserve_no_space,
+    );
+    inc_redhare(
+        &metrics.remote_dram_reserve_failed,
+        labels,
+        stats.remote_dram_reserve_failed,
+    );
+    inc_redhare(
+        &metrics.remote_dram_bind,
+        labels,
+        stats.remote_dram_bind_total,
+    );
+    inc_redhare(
+        &metrics.remote_dram_bind_failed,
+        labels,
+        stats.remote_dram_bind_failed,
+    );
+    inc_redhare(
+        &metrics.remote_dram_free,
+        labels,
+        stats.remote_dram_free_total,
+    );
+    inc_redhare(
+        &metrics.remote_dram_free_failed,
+        labels,
+        stats.remote_dram_free_failed,
+    );
+    inc_redhare(
+        &metrics.remote_dram_reserve_reaped,
+        labels,
+        stats.remote_dram_reserve_reaped,
+    );
+    inc_redhare(
+        &metrics.remote_dram_evictions,
+        labels,
+        stats.remote_dram_evictions,
+    );
+    inc_redhare(
+        &metrics.remote_dram_window_evictions,
+        labels,
+        stats.remote_dram_window_evictions,
+    );
+    inc_redhare(
+        &metrics.remote_dram_main_evictions,
+        labels,
+        stats.remote_dram_main_evictions,
+    );
+    inc_redhare(
+        &metrics.remote_dram_window_promotions,
+        labels,
+        stats.remote_dram_window_promotions,
+    );
+    inc_redhare(
+        &metrics.remote_dram_tinylfu_protected,
+        labels,
+        stats.remote_dram_tinylfu_protected,
+    );
+    inc_redhare(
+        &metrics.remote_dram_evicted_bytes,
+        labels,
+        stats.remote_dram_evicted_bytes,
+    );
+    inc_redhare(
+        &metrics.remote_dram_write_bytes,
+        labels,
+        stats.remote_dram_write_bytes,
+    );
+    inc_redhare(
+        &metrics.connector_save_failed,
+        labels,
+        stats.connector_save_failed,
+    );
+    inc_redhare(
+        &metrics.connector_load_failed,
+        labels,
+        stats.connector_load_failed,
+    );
+    inc_redhare(
+        &metrics.connector_chunks_dedup_skipped,
+        labels,
+        stats.connector_chunks_dedup_skipped,
+    );
+    inc_redhare(
+        &metrics.connector_chunks_skipped_unbacked,
+        labels,
+        stats.connector_chunks_skipped_unbacked,
+    );
+    inc_redhare(
+        &metrics.connector_chunks_skipped_retention,
+        labels,
+        stats.connector_chunks_skipped_retention,
+    );
+    inc_redhare(
+        &metrics.connector_save_skipped_behind,
+        labels,
+        stats.connector_save_skipped_behind,
+    );
+    inc_redhare(
+        &metrics.connector_save_cancelled,
+        labels,
+        stats.connector_save_cancelled,
+    );
+    inc_redhare(
+        &metrics.connector_load_cancelled,
+        labels,
+        stats.connector_load_cancelled,
+    );
+    inc_redhare(
+        &metrics.connector_save_unpublished,
+        labels,
+        stats.connector_save_unpublished,
+    );
+    inc_redhare(
+        &metrics.connector_preempt_fence_timeout,
+        labels,
+        stats.connector_preempt_fence_timeout,
+    );
+    inc_redhare(
+        &metrics.connector_ssm_fp_checked,
+        labels,
+        stats.connector_ssm_fp_checked,
+    );
+    inc_redhare(
+        &metrics.connector_ssm_fp_mismatch,
+        labels,
+        stats.connector_ssm_fp_mismatch,
+    );
+    inc_redhare(
+        &metrics.connector_ssm_fp_unsampled,
+        labels,
+        stats.connector_ssm_fp_unsampled,
+    );
+    inc_redhare(
+        &metrics.external_cache_lookup,
+        labels,
+        stats.external_cache_lookup,
+    );
+    inc_redhare(
+        &metrics.external_cache_eligible_tokens,
+        labels,
+        stats.external_cache_eligible_tokens,
+    );
+    inc_redhare(
+        &metrics.external_cache_hit_tokens,
+        labels,
+        stats.external_cache_hit_tokens,
+    );
+
+    inc_redhare_path(&metrics.put_path, labels, "local", stats.put_path_local);
+    inc_redhare_path(&metrics.put_path, labels, "remote", stats.put_path_remote);
+    inc_redhare_path(
+        &metrics.put_path,
+        labels,
+        "shared_fs",
+        stats.put_path_shared_fs,
+    );
+    inc_redhare_path(
+        &metrics.put_path,
+        labels,
+        "local_disk",
+        stats.put_path_local_disk,
+    );
+    inc_redhare_path(&metrics.put_bytes, labels, "local", stats.put_bytes_local);
+    inc_redhare_path(&metrics.put_bytes, labels, "remote", stats.put_bytes_remote);
+    inc_redhare_path(
+        &metrics.put_bytes,
+        labels,
+        "shared_fs",
+        stats.put_bytes_shared_fs,
+    );
+    inc_redhare_path(
+        &metrics.put_bytes,
+        labels,
+        "local_disk",
+        stats.put_bytes_local_disk,
+    );
+    inc_redhare_path(&metrics.get_bytes, labels, "local", stats.get_bytes_local);
+    inc_redhare_path(&metrics.get_bytes, labels, "remote", stats.get_bytes_remote);
+    inc_redhare_path(
+        &metrics.get_bytes,
+        labels,
+        "shared_fs",
+        stats.get_bytes_shared_fs,
+    );
+    inc_redhare_path(
+        &metrics.get_bytes,
+        labels,
+        "local_disk",
+        stats.get_bytes_local_disk,
+    );
+    inc_redhare_path(
+        &metrics.local_admission_bypass,
+        labels,
+        "remote",
+        stats.local_admission_bypass_remote,
+    );
+    inc_redhare_path(
+        &metrics.local_admission_bypass,
+        labels,
+        "shared_fs",
+        stats.local_admission_bypass_shared_fs,
+    );
+    inc_redhare_path(
+        &metrics.local_admission_bypass,
+        labels,
+        "local_disk",
+        stats.local_admission_bypass_local_disk,
+    );
+
+    set_redhare_gauge(
+        &metrics.local_objects_current,
+        labels,
+        stats.local_objects_current,
+    );
+    set_redhare_gauge(
+        &metrics.local_bytes_current,
+        labels,
+        stats.local_bytes_current,
+    );
+    set_redhare_gauge(
+        &metrics.local_capacity_bytes,
+        labels,
+        stats.local_capacity_bytes,
+    );
+    set_redhare_gauge(&metrics.local_free_bytes, labels, stats.local_free_bytes);
+    set_redhare_gauge(
+        &metrics.kvcache_capacity_bytes,
+        labels,
+        stats.kvcache_capacity_bytes,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_slots_current,
+        labels,
+        stats.remote_dram_slots_current,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_bytes_current,
+        labels,
+        stats.remote_dram_bytes_current,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_window_percent_bps,
+        labels,
+        stats.remote_dram_window_percent_bps,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_window_slots_current,
+        labels,
+        stats.remote_dram_window_slots_current,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_window_bytes_current,
+        labels,
+        stats.remote_dram_window_bytes_current,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_main_slots_current,
+        labels,
+        stats.remote_dram_main_slots_current,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_main_bytes_current,
+        labels,
+        stats.remote_dram_main_bytes_current,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_capacity_bytes,
+        labels,
+        stats.remote_dram_capacity_bytes,
+    );
+    set_redhare_gauge(
+        &metrics.remote_dram_free_bytes,
+        labels,
+        stats.remote_dram_free_bytes,
+    );
+
+    observe_redhare_us(&metrics.put_latency_seconds, labels, &stats.put_latency_us);
+    observe_redhare_us(
+        &metrics.transport_read_latency_seconds,
+        labels,
+        &stats.transport_read_latency_us,
+    );
+    observe_redhare_us(
+        &metrics.remove_latency_seconds,
+        labels,
+        &stats.remove_latency_us,
+    );
+    for (outcome, samples) in [
+        ("local", &stats.get_latency_us_local),
+        ("remote", &stats.get_latency_us_remote),
+        ("shared_fs", &stats.get_latency_us_shared_fs),
+        ("local_disk", &stats.get_latency_us_local_disk),
+        ("miss", &stats.get_latency_us_miss),
+    ] {
+        if samples.is_empty() {
+            continue;
+        }
+        let histogram = metrics.get_latency_seconds.get_or_create(&RedhareOutcomeLabels {
+            model_name: labels.model_name.clone(),
+            engine: labels.engine,
+            outcome,
+        });
+        for sample_us in samples {
+            histogram.observe(*sample_us as f64 / 1e6);
+        }
+    }
 }
 
 /// Exports `vllm:lora_requests_info` as a single series covering all LoRA
@@ -662,5 +1089,53 @@ mod tests {
                 "vllm:mooncake_num_failed_recvs_total{model_name=\"model\",engine=\"0\"} 1"
             )
         );
+    }
+
+    /// A flat Redhare payload is not swallowed by `Multi`, and microseconds
+    /// become seconds on the same metric names the Python frontend registers.
+    #[test]
+    fn redhare_stats_are_recorded_into_redhare_metrics() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let kv_connector_stats: KvConnectorStats = serde_json::from_value(serde_json::json!({
+            "put_total": 2,
+            "get_hit_local": 1,
+            "put_path_remote": 4,
+            "get_bytes_local": 50,
+            "local_admission_bypass_shared_fs": 3,
+            "local_objects_current": 7,
+            "put_latency_us": [1000, 3000],
+            "get_latency_us_remote": [2000],
+            "future_counter": 9,
+            "_n_steps": 1,
+        }))
+        .unwrap();
+        assert!(matches!(kv_connector_stats, KvConnectorStats::Redhare(_)));
+        super::record_scheduler_stats_with_handles(
+            &handles,
+            &SchedulerStats {
+                kv_connector_stats: Some(kv_connector_stats),
+                ..Default::default()
+            },
+        );
+
+        let rendered = metrics.render().unwrap();
+        let series = rendered
+            .lines()
+            .filter(|line| line.starts_with("redhare_") && !line.contains("_bucket{"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        expect![[r#"
+            redhare_put_path_total{model_name="model",engine="0",path="remote"} 4
+            redhare_get_bytes_total{model_name="model",engine="0",path="local"} 50
+            redhare_local_admission_bypass_total{model_name="model",engine="0",path="shared_fs"} 3
+            redhare_get_latency_seconds_sum{model_name="model",engine="0",outcome="remote"} 0.002
+            redhare_get_latency_seconds_count{model_name="model",engine="0",outcome="remote"} 1
+            redhare_put_total{model_name="model",engine="0"} 2
+            redhare_get_hit_local_total{model_name="model",engine="0"} 1
+            redhare_put_latency_seconds_sum{model_name="model",engine="0"} 0.004
+            redhare_put_latency_seconds_count{model_name="model",engine="0"} 2
+            redhare_local_objects_current{model_name="model",engine="0"} 7"#]]
+        .assert_eq(&series);
     }
 }

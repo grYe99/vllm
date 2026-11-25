@@ -292,6 +292,191 @@ pub mod kv_connector {
     #[serde(transparent)]
     pub struct MooncakeStats(pub BTreeMap<MooncakeOperation, Vec<MooncakeRecord>>);
 
+    /// Redhare connector telemetry.
+    ///
+    /// Original Python definition: `RedhareKVConnectorStats.data` produced by
+    /// `redhare.vllm_connector.stats.empty_stats_data` and returned from
+    /// `KVConnectorStats.to_dict`. `put_total` is always present on that
+    /// payload and is the discriminator against other flat connector maps.
+    /// Unknown keys are ignored so a newer Redhare wheel can add counters
+    /// without the Rust frontend dropping the whole sample.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct RedhareStats {
+        pub put_total: u64,
+        #[serde(default)]
+        pub put_failed: u64,
+        #[serde(default)]
+        pub put_fingerprint_mismatch: u64,
+        #[serde(default)]
+        pub get_total: u64,
+        #[serde(default)]
+        pub get_hit_local: u64,
+        #[serde(default)]
+        pub get_hit_remote: u64,
+        #[serde(default)]
+        pub get_hit_shared_fs: u64,
+        #[serde(default)]
+        pub get_hit_local_disk: u64,
+        #[serde(default)]
+        pub get_miss: u64,
+        #[serde(default)]
+        pub get_fingerprint_mismatch: u64,
+        #[serde(default)]
+        pub bytes_put: u64,
+        #[serde(default)]
+        pub bytes_get: u64,
+        #[serde(default)]
+        pub put_path_local: u64,
+        #[serde(default)]
+        pub put_path_remote: u64,
+        #[serde(default)]
+        pub put_path_shared_fs: u64,
+        #[serde(default)]
+        pub put_path_local_disk: u64,
+        #[serde(default)]
+        pub put_bytes_local: u64,
+        #[serde(default)]
+        pub put_bytes_remote: u64,
+        #[serde(default)]
+        pub put_bytes_shared_fs: u64,
+        #[serde(default)]
+        pub put_bytes_local_disk: u64,
+        #[serde(default)]
+        pub get_bytes_local: u64,
+        #[serde(default)]
+        pub get_bytes_remote: u64,
+        #[serde(default)]
+        pub get_bytes_shared_fs: u64,
+        #[serde(default)]
+        pub get_bytes_local_disk: u64,
+        #[serde(default)]
+        pub local_evictions: u64,
+        #[serde(default)]
+        pub local_admission_bypass_remote: u64,
+        #[serde(default)]
+        pub local_admission_bypass_shared_fs: u64,
+        #[serde(default)]
+        pub local_admission_bypass_local_disk: u64,
+        #[serde(default)]
+        pub local_tinylfu_protected: u64,
+        #[serde(default)]
+        pub shared_fs_demote_total: u64,
+        #[serde(default)]
+        pub local_disk_demote_total: u64,
+        #[serde(default)]
+        pub shared_fs_demote_failed: u64,
+        #[serde(default)]
+        pub local_disk_demote_failed: u64,
+        #[serde(default)]
+        pub remote_dram_reserve_total: u64,
+        #[serde(default)]
+        pub remote_dram_reserve_no_space: u64,
+        #[serde(default)]
+        pub remote_dram_reserve_failed: u64,
+        #[serde(default)]
+        pub remote_dram_bind_total: u64,
+        #[serde(default)]
+        pub remote_dram_bind_failed: u64,
+        #[serde(default)]
+        pub remote_dram_free_total: u64,
+        #[serde(default)]
+        pub remote_dram_free_failed: u64,
+        #[serde(default)]
+        pub remote_dram_reserve_reaped: u64,
+        #[serde(default)]
+        pub remote_dram_evictions: u64,
+        #[serde(default)]
+        pub remote_dram_window_evictions: u64,
+        #[serde(default)]
+        pub remote_dram_main_evictions: u64,
+        #[serde(default)]
+        pub remote_dram_window_promotions: u64,
+        #[serde(default)]
+        pub remote_dram_tinylfu_protected: u64,
+        #[serde(default)]
+        pub remote_dram_evicted_bytes: u64,
+        #[serde(default)]
+        pub remote_dram_write_bytes: u64,
+        #[serde(default)]
+        pub connector_save_failed: u64,
+        #[serde(default)]
+        pub connector_load_failed: u64,
+        #[serde(default)]
+        pub connector_chunks_dedup_skipped: u64,
+        #[serde(default)]
+        pub connector_chunks_skipped_unbacked: u64,
+        #[serde(default)]
+        pub connector_chunks_skipped_retention: u64,
+        #[serde(default)]
+        pub connector_save_skipped_behind: u64,
+        #[serde(default)]
+        pub connector_save_cancelled: u64,
+        #[serde(default)]
+        pub connector_load_cancelled: u64,
+        #[serde(default)]
+        pub connector_save_unpublished: u64,
+        #[serde(default)]
+        pub connector_preempt_fence_timeout: u64,
+        #[serde(default)]
+        pub connector_ssm_fp_checked: u64,
+        #[serde(default)]
+        pub connector_ssm_fp_mismatch: u64,
+        #[serde(default)]
+        pub connector_ssm_fp_unsampled: u64,
+        #[serde(default)]
+        pub external_cache_lookup: u64,
+        #[serde(default)]
+        pub external_cache_eligible_tokens: u64,
+        #[serde(default)]
+        pub external_cache_hit_tokens: u64,
+        /// Gauges use `Option` so a missing key is not published as zero.
+        #[serde(default)]
+        pub local_objects_current: Option<u64>,
+        #[serde(default)]
+        pub local_bytes_current: Option<u64>,
+        #[serde(default)]
+        pub local_capacity_bytes: Option<u64>,
+        #[serde(default)]
+        pub local_free_bytes: Option<u64>,
+        #[serde(default)]
+        pub kvcache_capacity_bytes: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_slots_current: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_bytes_current: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_window_percent_bps: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_window_slots_current: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_window_bytes_current: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_main_slots_current: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_main_bytes_current: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_capacity_bytes: Option<u64>,
+        #[serde(default)]
+        pub remote_dram_free_bytes: Option<u64>,
+        /// Latencies are microseconds, matching the Python stats dict.
+        #[serde(default)]
+        pub put_latency_us: Vec<u64>,
+        #[serde(default)]
+        pub get_latency_us_local: Vec<u64>,
+        #[serde(default)]
+        pub get_latency_us_remote: Vec<u64>,
+        #[serde(default)]
+        pub get_latency_us_shared_fs: Vec<u64>,
+        #[serde(default)]
+        pub get_latency_us_local_disk: Vec<u64>,
+        #[serde(default)]
+        pub get_latency_us_miss: Vec<u64>,
+        #[serde(default)]
+        pub transport_read_latency_us: Vec<u64>,
+        #[serde(default)]
+        pub remove_latency_us: Vec<u64>,
+    }
+
     /// Telemetry emitted by a `MultiConnector` with a flat child payload map.
     #[serde_with::skip_serializing_none]
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -306,6 +491,8 @@ pub mod kv_connector {
         pub mooncake_transfer: Option<MooncakeTransferStats>,
         #[serde(rename = "MooncakeStoreConnector")]
         pub mooncake: Option<MooncakeStats>,
+        #[serde(rename = "RedhareConnector")]
+        pub redhare: Option<RedhareStats>,
         /// Child connector payloads without a Rust telemetry implementation.
         #[serde(flatten)]
         pub other: BTreeMap<String, OpaqueValue>,
@@ -321,6 +508,7 @@ pub mod kv_connector {
         Nixl(NixlStats),
         MooncakeTransfer(MooncakeTransferStats),
         Mooncake(MooncakeStats),
+        Redhare(RedhareStats),
         Multi(Box<MultiConnectorStats>),
         Other(BTreeMap<String, OpaqueValue>),
     }

@@ -10,6 +10,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 
 use crate::buckets::{BucketConfig, BucketFamily, FamilyHistogram};
+use crate::redhare::RedhareMetrics;
 use crate::{BucketHistogramFamily, F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
 // Buckets copied verbatim from the Python `MooncakeStorePromMetrics` /
@@ -268,6 +269,9 @@ pub struct SchedulerMetrics {
     pub nixl_num_failed_transfers: Family<EngineLabels, U64Counter>,
     pub nixl_num_failed_notifications: Family<EngineLabels, U64Counter>,
     pub nixl_num_kv_expired_reqs: Family<EngineLabels, U64Counter>,
+
+    // Redhare connector telemetry. Mirrors `RedhareKVConnectorPromMetrics`.
+    pub redhare: RedhareMetrics,
 
     /// Non-Prometheus interval accumulators for periodic text-log helpers.
     pub log_stats: Family<EngineLabels, SchedulerLogStatsAccumulator>,
@@ -578,6 +582,8 @@ impl SchedulerMetrics {
             nixl_num_kv_expired_reqs.clone(),
         );
 
+        let redhare = RedhareMetrics::register(registry);
+
         Self {
             scheduler_running,
             scheduler_waiting,
@@ -617,6 +623,7 @@ impl SchedulerMetrics {
             nixl_num_failed_transfers,
             nixl_num_failed_notifications,
             nixl_num_kv_expired_reqs,
+            redhare,
             log_stats: Family::default(),
         }
     }

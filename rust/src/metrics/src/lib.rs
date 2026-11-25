@@ -16,12 +16,14 @@ use crate::buckets::BucketConfig;
 mod api_server;
 mod buckets;
 mod histogram;
+mod redhare;
 mod request;
 mod scheduler;
 
 pub use api_server::*;
 pub use buckets::{BucketFamily, CustomHistogramBuckets, FamilyHistogram};
 pub use histogram::Histogram;
+pub use redhare::*;
 pub use request::*;
 pub use scheduler::*;
 
