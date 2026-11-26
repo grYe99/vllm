@@ -411,11 +411,11 @@ EMBEDS_TYPES = {
 }
 
 # Processor kwargs whose list value applies element-wise to a request's videos
-# in order (Qwen3-VL `fps`/`num_frames`, HY4 `second_per_grid_ts`). A child
+# in order (Qwen3-VL `fps`/`num_frames`). A child
 # request that carries a subset of the videos must carry the matching subset
 # of the list, or the encoder samples every child with the first element and
 # publishes under a hash the consumer never looks up.
-PER_VIDEO_MM_KWARGS = ("fps", "num_frames", "second_per_grid_ts")
+PER_VIDEO_MM_KWARGS = ("fps", "num_frames")
 
 
 def encoder_rr_assignment(
@@ -588,11 +588,12 @@ def _slice_mm_processor_kwargs(
     `video_indices` are the positions of those videos among the original
     request's videos. Scalars and unrelated kwargs pass through unchanged, in
     whatever scope (flat or `videos_kwargs`) the request used; a child
-    without videos drops the per-video keys entirely. `mm_kwargs` itself is
+    without videos drops the per-video lists if the original request has videos.
+    An image-only original request retains its kwargs. `mm_kwargs` itself is
     never modified, and the sliced value stays a list so both sides of the
     transfer fold the same element into the cache hash.
     """
-    if not isinstance(mm_kwargs, dict):
+    if not isinstance(mm_kwargs, dict) or not num_videos:
         return mm_kwargs
 
     scopes = [mm_kwargs]
