@@ -683,17 +683,17 @@ def test_processor_per_video_hashes_survive_partitioning(
     tail = run(2, videos, scoped_form({"num_frames": [8, 16, 32]}), ["v0", "v1"])
     assert tail["mm_hashes"] == full["mm_hashes"]
 
-    # Changing only video 1\'s effective value must invalidate only its key.
+    # Changing only the second video's effective value must invalidate only its key.
     changed = run(2, videos, scoped_form({"num_frames": [8, 24]}), ["v0", "v1"])
     assert changed["mm_hashes"]["video"][0] == full["mm_hashes"]["video"][0]
     assert changed["mm_hashes"]["video"][1] != full["mm_hashes"]["video"][1]
 
 
 @pytest.mark.parametrize("model_id", [MODEL_ID])
-@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("form", ["flat", "scoped", "shadowed"])
 @pytest.mark.skip_global_cleanup
 def test_processor_image_hash_survives_video_partitioning(
-    model_id: str, scoped: bool
+    model_id: str, form: str
 ) -> None:
     """Image child and mixed parent must agree after slicing video lists."""
     ctx = build_model_context(
@@ -703,11 +703,14 @@ def test_processor_image_hash_survives_video_partitioning(
     processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
     image = np.zeros((128, 128, 3), dtype=np.uint8)
     video = _build_video_mm_data(num_frames=32, original_fps=8.0)["video"][0]
-    kwargs = {"num_frames": [8]}
-    child_kwargs = {}
-    if scoped:
+    kwargs: dict[str, Any] = {"num_frames": [8]}
+    child_kwargs: dict[str, Any] = {}
+    if form != "flat":
         kwargs = {"videos_kwargs": kwargs}
         child_kwargs = {"videos_kwargs": {}}
+    if form == "shadowed":
+        kwargs["num_frames"] = 16
+        child_kwargs["num_frames"] = 16
 
     image_prompt = "<|vision_start|><|image_pad|><|vision_end|>"
     video_prompt = "<|vision_start|><|video_pad|><|vision_end|>"
