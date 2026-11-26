@@ -1350,14 +1350,15 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         kwargs = dict(inputs.hf_processor_mm_kwargs)
         videos_kwargs = kwargs.get("videos_kwargs")
         if isinstance(videos_kwargs, dict):
-            kwargs["videos_kwargs"] = {
-                key: value
-                for key, value in videos_kwargs.items()
-                if key not in per_video_kwargs
-            }
-        kwargs = {
-            key: value for key, value in kwargs.items() if key not in per_video_kwargs
-        }
+            kwargs["videos_kwargs"] = dict(videos_kwargs)
+        else:
+            videos_kwargs = {}
+        for key in per_video_kwargs:
+            # Mirror explicit scoped-over-flat precedence. Retain shadowed
+            # values and scalars; the proxy partitions only the active list.
+            scope = kwargs["videos_kwargs"] if key in videos_kwargs else kwargs
+            if isinstance(scope.get(key), list):
+                scope.pop(key)
         hashes = dict(
             super()._get_mm_hashes(replace(inputs, hf_processor_mm_kwargs=kwargs))
         )
