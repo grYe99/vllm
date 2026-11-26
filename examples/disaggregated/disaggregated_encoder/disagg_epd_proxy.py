@@ -596,40 +596,32 @@ def _slice_mm_processor_kwargs(
     if not isinstance(mm_kwargs, dict) or not num_videos:
         return mm_kwargs
 
-    scopes = [mm_kwargs]
-    if isinstance(mm_kwargs.get("videos_kwargs"), dict):
-        scopes.append(mm_kwargs["videos_kwargs"])
-    if not any(
-        isinstance(scope.get(key), list)
-        for scope in scopes
-        for key in PER_VIDEO_MM_KWARGS
-    ):
-        return mm_kwargs
+    child = dict(mm_kwargs)
+    scoped = mm_kwargs.get("videos_kwargs")
+    if isinstance(scoped, dict):
+        child["videos_kwargs"] = dict(scoped)
+    else:
+        scoped = {}
 
-    child = {
-        key: dict(value) if isinstance(value, dict) else value
-        for key, value in mm_kwargs.items()
-    }
-    child_scopes = [child]
-    if isinstance(child.get("videos_kwargs"), dict):
-        child_scopes.append(child["videos_kwargs"])
-    for scope in child_scopes:
-        for key in PER_VIDEO_MM_KWARGS:
-            value = scope.get(key)
-            if not isinstance(value, list):
-                continue
-            if num_videos and len(value) < num_videos:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"mm_processor_kwargs: {key} needs at least {num_videos}"
-                        " entries, one per video."
-                    ),
-                )
-            if video_indices:
-                scope[key] = [value[i] for i in video_indices]
-            else:
-                scope.pop(key)
+    for key in PER_VIDEO_MM_KWARGS:
+        # An explicit scoped value takes precedence over the flat spelling.
+        # Leave the shadowed value untouched so the base hash stays consistent.
+        scope = child["videos_kwargs"] if key in scoped else child
+        value = scope.get(key)
+        if not isinstance(value, list):
+            continue
+        if len(value) < num_videos:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"mm_processor_kwargs: {key} needs at least {num_videos}"
+                    " entries, one per video."
+                ),
+            )
+        if video_indices:
+            scope[key] = [value[i] for i in video_indices]
+        else:
+            scope.pop(key)
     return child
 
 
