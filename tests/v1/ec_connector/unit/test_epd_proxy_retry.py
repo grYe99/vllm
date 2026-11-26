@@ -790,42 +790,52 @@ def test_fanout_slices_per_video_kwargs(proxy, monkeypatch, nested):
         assert by_url[url]["media_io_kwargs"] == {"video": {"fps": 12}}
 
 
-def test_fanout_slices_second_per_grid_ts_keeps_scalars(proxy, monkeypatch):
-    """HY4-style per-video timings slice too; scalar values pass through."""
+def test_fanout_keeps_scalar_and_unrelated_kwargs(proxy, monkeypatch):
+    """Only known per-video lists are partitioned."""
     seen: list = []
     monkeypatch.setattr(proxy, "encode_session", _FanoutSession(seen))
     monkeypatch.setattr(proxy, "encoder_rr_idx", 0)
-    kwargs = {
-        "videos_kwargs": {
-            "second_per_grid_ts": [0.5, 2.0],
-            "fps": 2.0,
-            "size": [420, 420],
-        }
-    }
+    kwargs = {"videos_kwargs": {"fps": 2.0, "size": [420, 420]}}
     body = {
         "messages": [{"role": "user", "content": [_vid("a"), _vid("b")]}],
         "mm_processor_kwargs": kwargs,
     }
     asyncio.run(proxy.fanout_encoder_primer(body, ["http://e0"], "r"))
-    by_url = {
-        b["messages"][0]["content"][0]["video_url"]["url"]: b["mm_processor_kwargs"][
-            "videos_kwargs"
-        ]
-        for _, b in seen
+    assert len(seen) == 2
+    for _, child in seen:
+        assert child["mm_processor_kwargs"] == kwargs
+
+
+@pytest.mark.parametrize("nested", [True, False], ids=["nested", "flat"])
+def test_fanout_keeps_kwargs_for_image_only_request(proxy, monkeypatch, nested):
+    """Without videos there is no per-video partition to perform."""
+    seen: list = []
+    monkeypatch.setattr(proxy, "encode_session", _FanoutSession(seen))
+    monkeypatch.setattr(proxy, "encoder_rr_idx", 0)
+    kwargs = {"num_frames": [16, 32]}
+    if nested:
+        kwargs = {"videos_kwargs": kwargs}
+    body = {
+        "messages": [{"role": "user", "content": [_img("a"), _img("b")]}],
+        "mm_processor_kwargs": kwargs,
     }
-    assert by_url["a"]["second_per_grid_ts"] == [0.5]
-    assert by_url["b"]["second_per_grid_ts"] == [2.0]
-    for scope in by_url.values():
-        assert scope["fps"] == 2.0
-        assert scope["size"] == [420, 420]
+    original = copy.deepcopy(body)
+    asyncio.run(proxy.fanout_encoder_primer(body, ["http://e0", "http://e1"], "r"))
+    assert len(seen) == 2
+    for _, child in seen:
+        assert child["mm_processor_kwargs"] == kwargs
+    assert body == original
 
 
-def test_fanout_interleaved_media_and_two_encoders(proxy, monkeypatch):
+@pytest.mark.parametrize("nested", [True, False], ids=["nested", "flat"])
+def test_fanout_interleaved_media_and_two_encoders(proxy, monkeypatch, nested):
     """Video positions count videos only; image children drop per-video keys."""
     seen: list = []
     monkeypatch.setattr(proxy, "encode_session", _FanoutSession(seen))
     monkeypatch.setattr(proxy, "encoder_rr_idx", 0)
-    kwargs = {"videos_kwargs": {"do_sample_frames": True, "num_frames": [16, 32]}}
+    kwargs = {"do_sample_frames": True, "num_frames": [16, 32]}
+    if nested:
+        kwargs = {"videos_kwargs": kwargs}
     body = {
         "messages": [
             {"role": "user", "content": [_img("x"), _vid("a")]},
@@ -844,7 +854,9 @@ def test_fanout_interleaved_media_and_two_encoders(proxy, monkeypatch):
         images = [
             i for i in batch["messages"][0]["content"] if i["type"] == "image_url"
         ]
-        scope = batch["mm_processor_kwargs"]["videos_kwargs"]
+        scope = batch["mm_processor_kwargs"]
+        if nested:
+            scope = scope["videos_kwargs"]
         if videos:
             # One video per child; position among the request's two videos.
             expected = [16] if videos[0]["video_url"]["url"] == "a" else [32]
