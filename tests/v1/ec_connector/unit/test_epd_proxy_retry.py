@@ -768,7 +768,12 @@ def test_fanout_slices_per_video_kwargs(proxy, monkeypatch, nested):
     seen: list = []
     monkeypatch.setattr(proxy, "encode_session", _FanoutSession(seen))
     monkeypatch.setattr(proxy, "encoder_rr_idx", 0)
-    scoped = {"do_sample_frames": True, "num_frames": [16, 32], "fps": [2.0, 4.0]}
+    scoped = {
+        "do_sample_frames": True,
+        "num_frames": [16, 32],
+        "fps": [2.0, 4.0],
+        "size": [420, 420],
+    }
     kwargs = {"videos_kwargs": dict(scoped)} if nested else dict(scoped)
     body = {
         "messages": [{"role": "user", "content": [_vid("a"), _vid("b")]}],
@@ -787,6 +792,7 @@ def test_fanout_slices_per_video_kwargs(proxy, monkeypatch, nested):
         assert scope["num_frames"] == num_frames
         assert scope["fps"] == fps
         assert scope["do_sample_frames"] is True
+        assert scope["size"] == [420, 420]
         assert by_url[url]["media_io_kwargs"] == {"video": {"fps": 12}}
 
 
@@ -890,3 +896,23 @@ def test_fanout_rejects_short_per_video_list(proxy, monkeypatch):
     with pytest.raises(proxy.HTTPException) as exc:
         asyncio.run(proxy.fanout_encoder_primer(body, ["http://e0"], "r"))
     assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize("scoped_value", [[16, 32], 16])
+def test_fanout_preserves_scoped_precedence(proxy, scoped_value):
+    """Only the effective list is sliced; a shadowed short list is legal."""
+    kwargs = {"num_frames": [99], "videos_kwargs": {"num_frames": scoped_value}}
+    original = copy.deepcopy(kwargs)
+    for index in range(2):
+        child = proxy._slice_mm_processor_kwargs(kwargs, [index], 2)
+        expected = [scoped_value[index]] if isinstance(scoped_value, list) else 16
+        assert child == {
+            "num_frames": [99],
+            "videos_kwargs": {"num_frames": expected},
+        }
+    image = proxy._slice_mm_processor_kwargs(kwargs, [], 2)
+    assert image["num_frames"] == [99]
+    assert image["videos_kwargs"] == (
+        {} if isinstance(scoped_value, list) else {"num_frames": 16}
+    )
+    assert kwargs == original
