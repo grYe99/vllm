@@ -223,19 +223,24 @@ class HYV4DecoderLayer(nn.Module):
         if sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states = self._deferred_reduce(hidden_states, sequence_parallel)
+        hidden_states = self._deferred_reduce(
+            hidden_states, sequence_parallel, self.self_attn
+        )
         residual, hidden_states, post_gates = self.ihc_mlp_boundary(
             residual, hidden_states, post_gates
         )
         if sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self._deferred_reduce(
-            self.mlp(hidden_states), sequence_parallel
+            self.mlp(hidden_states), sequence_parallel, self.mlp
         )
         return IHCCarry(hidden_states, residual, post_gates)
 
     def _deferred_reduce(
-        self, hidden_states: torch.Tensor, sequence_parallel: bool
+        self,
+        hidden_states: torch.Tensor,
+        sequence_parallel: bool,
+        sub_block: nn.Module,
     ) -> torch.Tensor:
         """Finish the TP reduction a sub-block skipped under `defer_reduction`."""
         if not self.defer_reduction:
@@ -296,7 +301,9 @@ class HYV4DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-        hidden_states = self._deferred_reduce(hidden_states, use_ihc_sequence_parallel)
+        hidden_states = self._deferred_reduce(
+            hidden_states, use_ihc_sequence_parallel, self.self_attn
+        )
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
@@ -305,7 +312,9 @@ class HYV4DecoderLayer(nn.Module):
         if use_ihc_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self._deferred_reduce(hidden_states, use_ihc_sequence_parallel)
+        hidden_states = self._deferred_reduce(
+            hidden_states, use_ihc_sequence_parallel, self.mlp
+        )
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.
@@ -317,6 +326,9 @@ class HYV4Model(nn.Module):
 
     decoder_layer_cls: type[HYV4DecoderLayer] = HYV4DecoderLayer
     supports_ihc_sequence_parallel = True
+
+    def _allows_ihc_sequence_parallel(self, vllm_config: VllmConfig) -> bool:
+        return self.supports_ihc_sequence_parallel
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -349,7 +361,7 @@ class HYV4Model(nn.Module):
         speculative_config = vllm_config.speculative_config
         self.ihc_sequence_parallel = (
             self.enable_ihc
-            and self.supports_ihc_sequence_parallel
+            and self._allows_ihc_sequence_parallel(vllm_config)
             and parallel_config.tensor_parallel_size > 1
             and parallel_config.data_parallel_size == 1
             and parallel_config.pipeline_parallel_size == 1
