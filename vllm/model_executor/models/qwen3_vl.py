@@ -1340,20 +1340,39 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         return per_video_kwargs
 
     def _get_mm_hashes(self, inputs: ProcessorInputs) -> MultiModalHashes:
-        hashes = dict(super()._get_mm_hashes(inputs))
-        per_video_kwargs = self._get_per_video_kwargs(
-            inputs.hf_processor_mm_kwargs, len(hashes.get("video", []))
+        per_video_kwargs = self._get_per_video_kwargs(inputs.hf_processor_mm_kwargs)
+        if not per_video_kwargs or "video" not in inputs.mm_data_items:
+            return super()._get_mm_hashes(inputs)
+        # The base hash must not fold the raw per-video lists: the rehash below
+        # already folds each video's own element, and folding the raw form too
+        # would make a partitioned encoder child (EPD fan-out carries a sliced
+        # list) hash the same video differently than the full request.
+        kwargs = dict(inputs.hf_processor_mm_kwargs)
+        videos_kwargs = kwargs.get("videos_kwargs")
+        if isinstance(videos_kwargs, dict):
+            kwargs["videos_kwargs"] = {
+                key: value
+                for key, value in videos_kwargs.items()
+                if key not in per_video_kwargs
+            }
+        kwargs = {
+            key: value for key, value in kwargs.items() if key not in per_video_kwargs
+        }
+        hashes = dict(
+            super()._get_mm_hashes(replace(inputs, hf_processor_mm_kwargs=kwargs))
         )
-        if per_video_kwargs and "video" in hashes:
-            algorithm = self.info.ctx.get_mm_config().mm_hasher_algorithm
-            hashes["video"] = [
-                MultiModalHasher.hash_kwargs(
-                    algorithm,
-                    mm_hash=mm_hash,
-                    **{key: values[i] for key, values in per_video_kwargs.items()},
-                )
-                for i, mm_hash in enumerate(hashes["video"])
-            ]
+        per_video_kwargs = self._get_per_video_kwargs(
+            inputs.hf_processor_mm_kwargs, len(hashes["video"])
+        )
+        algorithm = self.info.ctx.get_mm_config().mm_hasher_algorithm
+        hashes["video"] = [
+            MultiModalHasher.hash_kwargs(
+                algorithm,
+                mm_hash=mm_hash,
+                **{key: values[i] for key, values in per_video_kwargs.items()},
+            )
+            for i, mm_hash in enumerate(hashes["video"])
+        ]
         return hashes
 
     def _get_cache_missing_processor_kwargs(
